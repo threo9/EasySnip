@@ -21,13 +21,10 @@ class Application : public QObject {
   private:
     void configureInput();
     void capture(const QString &mode = "region", const QRect &preset = {}, int delay = -1);
+    void showCapture(Native::Desktop desktop, const QRect &initial);
     void capturePreset();
     void edit(Document document, const QRect &sourceRect = {}, const QString &recordId = {});
     void openImage(const QString &path);
-    void pinClipboard();
-    void pinImage(const QImage &image);
-    bool pin(const QString &id);
-    void syncPins();
     void recordAction(const QString &id, const QString &action);
     bool output(const Document &document, const QString &action, QWidget *owner, QString &recordId,
                 bool skipAutoSave);
@@ -42,15 +39,15 @@ class Application : public QObject {
     QSystemTrayIcon *tray_ = nullptr;
     QMenu *trayMenu_ = nullptr;
     GlobalInput input_;
-    QMap<QString, QPointer<PinWindow>> pins_;
     QVector<QPointer<EditorWindow>> editors_;
     QPointer<CaptureOverlay> capture_;
     QTimer corners_;
     QTimer themeTimer_;
+    QTimer hotkeyRetry_;
+    QMap<int, QKeySequence> pendingHotkeys_;
     QString corner_;
     QElapsedTimer cornerTime_;
     bool cornerTriggered_ = false;
-    bool pinsHidden_ = false;
     bool capturePending_ = false;
     bool inputIgnored_ = false;
     bool quitting_ = false;

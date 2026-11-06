@@ -45,6 +45,25 @@ void Settings::setToolColor(const QString &tool, const QColor &color) {
     set("colors/" + tool, color.name(QColor::HexArgb));
 }
 
+QString Settings::shortcut(const QString &command) const {
+    const QMap<QString, QString> defaults{{"capture", "F1"}, {"last", "F4"}, {"active", "Ctrl+Shift+F1"},
+        {"history", "Ctrl+Shift+F3"}, {"command", ""}};
+    return value("hotkeys/" + command, defaults.value(command)).toString();
+}
+
+bool Settings::ignoresShortcut(const QString &command, const QString &executable) const {
+    const QString patterns = value("hotkeys/ignored").toString() + ';' +
+                             value("hotkeys/ignored/" + command).toString();
+    return Native::matchesProcess(executable, patterns.split(';', Qt::SkipEmptyParts));
+}
+
+QString Settings::action(const QString &key, const QString &fallback) const {
+    const QStringList commands{"capture", "screen", "fullscreen", "active", "last", "preset",
+        "history", "settings", "menu", "none", "clear-history", "backup", "restore", "custom-command", "quit"};
+    const QString selected = value(key, fallback).toString();
+    return commands.contains(selected) ? selected : fallback;
+}
+
 int uiPixels(int pixels) {
     const double scale = qApp->property("EasySnipUiScale").toDouble();
     return qRound(pixels * (scale > 0 ? scale : 1.0));
@@ -168,35 +187,38 @@ bool showSettings(Settings &settings, QWidget *parent) {
         auto *combo = new QComboBox;
         for (int i = 0; i < values.size(); ++i)
             combo->addItem(labels.value(i, values[i]), values[i]);
-        combo->setCurrentIndex(qMax(0, values.indexOf(settings.value(key, fallback).toString())));
+        const int index = values.indexOf(settings.value(key, fallback).toString());
+        combo->setCurrentIndex(index >= 0 ? index : values.indexOf(fallback));
         form->addRow(label, combo);
         save.append([&, combo, key] { settings.set(key, combo->currentData()); });
     };
 
     auto *general = page(QStringLiteral("常规"));
     check(general, QStringLiteral("开机启动"), "general/autostart", false);
-    check(general, QStringLiteral("启动时恢复贴图"), "pins/restore", true);
+    check(general, QStringLiteral("以管理员权限启动（下次启动时请求 UAC 确认）"), "runtime/administrator", false);
     check(general, QStringLiteral("显示托盘图标"), "general/tray", true);
     check(general, QStringLiteral("显示操作通知"), "general/notifications", true);
     check(general, QStringLiteral("跟随系统强调色"), "appearance/followSystem", false);
     text(general, QStringLiteral("主题色 HEX"), "appearance/accent", "#54d6b0");
     text(general, QStringLiteral("界面字体"), "appearance/font", "Microsoft YaHei UI");
     text(general, QStringLiteral("自定义托盘图标路径"), "appearance/icon", "");
-    const QStringList actions{"capture", "clipboard", "toggle-pins", "history", "settings", "menu", "none"};
-    const QStringList labels{QStringLiteral("截图"),          QStringLiteral("剪贴板贴图"),
-                             QStringLiteral("显示/隐藏贴图"), QStringLiteral("历史与贴图"),
+    const QStringList actions{"capture", "history", "settings", "menu", "none"};
+    const QStringList labels{QStringLiteral("截图"), QStringLiteral("截图历史"),
                              QStringLiteral("设置"),          QStringLiteral("菜单"),
                              QStringLiteral("无操作")};
     choices(general, QStringLiteral("托盘左键"), "tray/left", actions, labels, "capture");
-    choices(general, QStringLiteral("托盘中键"), "tray/middle", actions, labels, "clipboard");
+    choices(general, QStringLiteral("托盘中键"), "tray/middle", actions, labels, "none");
     choices(general, QStringLiteral("托盘右键"), "tray/right", actions, labels, "menu");
 
     auto *capture = page(QStringLiteral("截图"));
     number(capture, QStringLiteral("默认延迟 / 秒"), "capture/delay", 0, 0, 120);
     check(capture, QStringLiteral("捕获鼠标指针"), "capture/cursor", false);
+    check(capture, QStringLiteral("自动检测界面元素"), "capture/elements", false);
     check(capture, QStringLiteral("其他窗口激活时取消截图"), "capture/cancelOnDeactivate", false);
     check(capture, QStringLiteral("保存取消或未输出的选区到历史"), "history/includeCanceled", false);
-    check(capture, QStringLiteral("Alt + Shift + 鼠标拖动进行超级截屏"), "capture/superDrag", true);
+    check(capture, QStringLiteral("启用修饰键 + 鼠标拖动超级截屏"), "capture/superDrag", true);
+    choices(capture, QStringLiteral("超级截屏修饰键"), "capture/superModifiers", {"Alt+Shift", "Win", "Ctrl+Alt"},
+            {}, "Alt+Shift");
     check(capture, QStringLiteral("显示辅助放大镜"), "magnifier/enabled", true);
     check(capture, QStringLiteral("放大镜显示像素网格"), "magnifier/grid", true);
     choices(capture, QStringLiteral("放大镜样式"), "magnifier/style", {"square", "round"},
@@ -206,34 +228,32 @@ bool showSettings(Settings &settings, QWidget *parent) {
     choices(capture, QStringLiteral("取色格式"), "color/format", {"HEX", "RGB", "HSV"}, {}, "HEX");
     check(capture, QStringLiteral("HEX 使用大写字母"), "color/uppercase", true);
     text(capture, QStringLiteral("检测排除程序（分号分隔）"), "capture/excluded", "");
-    check(capture, QStringLiteral("WASD 作为方向键"), "input/wasd", false);
+    check(capture, QStringLiteral("WASD 逐像素移动鼠标（含拖拽中）"), "input/wasd", true);
 
     auto *shortcuts = page(QStringLiteral("快捷键"));
     check(shortcuts, QStringLiteral("启用全局快捷键"), "hotkeys/enabled", true);
     check(shortcuts, QStringLiteral("允许字母或数字单键快捷键"), "hotkeys/allowSimple", false);
-    const QStringList keys{"capture", "clipboard", "toggle", "last", "active", "history", "command"};
-    const QStringList names{QStringLiteral("区域截图"),      QStringLiteral("剪贴板贴图"),
-                            QStringLiteral("显示/隐藏贴图"), QStringLiteral("复用上次区域"),
+    const QStringList keys{"capture", "last", "active", "history", "command"};
+    const QStringList names{QStringLiteral("区域截图"), QStringLiteral("复用上次区域"),
                             QStringLiteral("当前活动窗口"),  QStringLiteral("历史"),
                             QStringLiteral("自定义命令")};
-    const QStringList defaults{"F1", "F3", "Ctrl+Shift+H", "F4", "Ctrl+Shift+F1", "Ctrl+Shift+F3", ""};
     for (int i = 0; i < keys.size(); ++i) {
         const QString key = "hotkeys/" + keys[i];
-        auto *edit = new QKeySequenceEdit(QKeySequence(settings.value(key, defaults[i]).toString()));
+        auto *edit = new QKeySequenceEdit(QKeySequence(settings.shortcut(keys[i])));
         shortcuts->addRow(names[i], edit);
         save.append(
             [&, key, edit] { settings.set(key, edit->keySequence().toString(QKeySequence::PortableText)); });
+        text(shortcuts, names[i] + QStringLiteral("忽略程序"), "hotkeys/ignored/" + keys[i], "");
     }
     text(shortcuts, QStringLiteral("忽略程序（名称/路径，支持 *）"), "hotkeys/ignored", "");
     text(shortcuts, QStringLiteral("自定义命令行"), "hotkeys/commandLine", "");
     text(shortcuts, QStringLiteral("编辑器复制快捷键"), "keys/copy", "Ctrl+C");
     text(shortcuts, QStringLiteral("编辑器保存快捷键"), "keys/save", "Ctrl+S");
-    text(shortcuts, QStringLiteral("编辑器贴图快捷键"), "keys/pin", "Ctrl+P");
     check(shortcuts, QStringLiteral("启用屏幕触发角（停留 600 毫秒）"), "corners/enabled", false);
     choices(shortcuts, QStringLiteral("左上角"), "corners/topLeft", actions, labels, "capture");
-    choices(shortcuts, QStringLiteral("右上角"), "corners/topRight", actions, labels, "clipboard");
+    choices(shortcuts, QStringLiteral("右上角"), "corners/topRight", actions, labels, "none");
     choices(shortcuts, QStringLiteral("左下角"), "corners/bottomLeft", actions, labels, "none");
-    choices(shortcuts, QStringLiteral("右下角"), "corners/bottomRight", actions, labels, "toggle-pins");
+    choices(shortcuts, QStringLiteral("右下角"), "corners/bottomRight", actions, labels, "none");
 
     auto *output = page(QStringLiteral("输出与存储"));
     auto *directory =
@@ -250,7 +270,6 @@ bool showSettings(Settings &settings, QWidget *parent) {
     check(output, QStringLiteral("复制时同时提供图片文件"), "output/copyFile", true);
     check(output, QStringLiteral("完成按钮 · 复制到剪贴板"), "output/copy", true);
     check(output, QStringLiteral("完成按钮 · 快捷保存"), "output/save", false);
-    check(output, QStringLiteral("完成按钮 · 贴到屏幕"), "output/pin", false);
     check(output, QStringLiteral("导出包含边框和阴影"), "output/frame", false);
     check(output, QStringLiteral("写入软件元数据"), "output/metadata", true);
     check(output, QStringLiteral("移除全不透明图像的 Alpha 通道"), "output/removeOpaqueAlpha", true);
@@ -258,9 +277,6 @@ bool showSettings(Settings &settings, QWidget *parent) {
     text(output, QStringLiteral("外部程序路径"), "output/program", "");
     text(output, QStringLiteral("外部程序参数，每行一个，{file} 为图片路径"), "output/arguments", "{file}");
     number(output, QStringLiteral("截图历史保留数量"), "history/limit", 100, 0, 10000);
-    number(output, QStringLiteral("关闭贴图可恢复数量"), "pins/recoverLimit", 20, 0, 1000);
-    number(output, QStringLiteral("贴图吸附距离 / 像素"), "pins/snapDistance", 12, 0, 100);
-    check(output, QStringLiteral("贴图允许边缘缩放"), "pins/edgeResize", true);
     check(output, QStringLiteral("新建标注后自动选中"), "annotation/selectNew", true);
     auto *note =
         new QLabel(QStringLiteral("高级配置位于 %1\n历史目录修改后重启生效，原目录中的记录仍可保留。")

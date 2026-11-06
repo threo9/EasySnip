@@ -3,6 +3,7 @@
 #include "settings.h"
 #include <QMainWindow>
 #include <QTimer>
+#include <QListWidget>
 
 class QDoubleSpinBox;
 class QSpinBox;
@@ -24,9 +25,14 @@ class AnnotationCanvas : public QWidget {
     void setZoom(double zoom);
     double zoom() const;
     void setBaseImage(const QImage &image);
+    void setCaptureBackground(const Document &background);
+    void setDocument(const Document &document);
+    void setDetectedElements(const QVector<QRect> &elements);
     void setRadius(int radius);
     void undo();
     void redo();
+    bool canUndo() const;
+    bool canRedo() const;
     void clear();
     void copyObject();
     void pasteObject();
@@ -35,11 +41,14 @@ class AnnotationCanvas : public QWidget {
     void finishDrawing();
     int selectedIndex() const;
     bool acceleratedPreview() const;
+    bool drawing() const;
   signals:
     void changed();
     void selectionChanged();
     void colorPicked(QString text);
     void positionChanged(QString text);
+    void toolChanged(Tool tool);
+    void imageCopyRequested();
 
   protected:
     void paintEvent(QPaintEvent *) override;
@@ -48,13 +57,16 @@ class AnnotationCanvas : public QWidget {
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
+    void keyReleaseEvent(QKeyEvent *event) override;
+    bool event(QEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
 
   private:
     void checkpoint();
     void redraw();
     void paintContent(QPainter &painter);
-    int objectAt(const QPointF &point) const;
+    int objectAt(const QPointF &point, bool sameTool = false) const;
+    bool matchElement(const QPointF &point);
     QPointF imagePoint(const QPoint &point) const;
     void translate(Annotation &item, const QPointF &delta);
     Document document_;
@@ -70,14 +82,50 @@ class AnnotationCanvas : public QWidget {
     bool drawing_ = false;
     bool moving_ = false;
     bool resizing_ = false;
+    bool rotating_ = false;
     bool polyline_ = false;
+    bool polylineDragged_ = false;
+    bool pointerDown_ = false;
+    int resizeCorner_ = -1;
     bool picker_ = false;
+    bool magnifier_ = false;
+    bool altUsed_ = false;
     bool penStraight_ = false;
     QPointF anchor_;
     QPointF previous_;
     QPointF hover_;
     Annotation original_;
     QOpenGLWidget *gpuPreview_ = nullptr;
+};
+
+class BrushTips : public QWidget {
+  public:
+    BrushTips(AnnotationCanvas *canvas, Settings &settings, QWidget *parent = nullptr);
+
+  protected:
+    bool eventFilter(QObject *object, QEvent *event) override;
+
+  private:
+    void rebuild();
+    void save();
+    AnnotationCanvas *canvas_;
+    Settings &settings_;
+    QVector<double> sizes_;
+};
+
+class PaletteWidget : public QListWidget {
+  public:
+    PaletteWidget(AnnotationCanvas *canvas, Settings &settings, QWidget *parent = nullptr);
+    void edit();
+
+  protected:
+    void dropEvent(QDropEvent *event) override;
+
+  private:
+    void reload();
+    void saveOrder();
+    AnnotationCanvas *canvas_;
+    Settings &settings_;
 };
 
 class EditorWindow : public QMainWindow {
@@ -114,7 +162,7 @@ class EditorWindow : public QMainWindow {
     QPushButton *color_ = nullptr;
     QPushButton *fill_ = nullptr;
     QPushButton *outline_ = nullptr;
-    QListWidget *palette_ = nullptr;
+    PaletteWidget *palette_ = nullptr;
     QRect sourceRect_;
     QTimer refreshTimer_;
     bool refreshing_ = false;

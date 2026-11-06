@@ -19,6 +19,12 @@ QString toolName(Tool tool) {
 QString toolKey(Tool tool) {
     return QString::number(int(tool));
 }
+bool isLineTool(Tool tool) {
+    return tool == Tool::Line || tool == Tool::Arrow || tool == Tool::Polyline;
+}
+bool isEffectTool(Tool tool) {
+    return tool == Tool::Highlighter || tool == Tool::Mosaic || tool == Tool::Blur || tool == Tool::Eraser;
+}
 
 QRectF Annotation::bounds() const {
     QRectF result = rect.normalized();
@@ -71,7 +77,7 @@ Annotation Annotation::fromJson(const QJsonObject &object) {
     item.fontSize = qBound(6.0, object["fontSize"].toDouble(24), 300.0);
     item.outlineWidth = qBound(0.0, object["outlineWidth"].toDouble(), 20.0);
     item.lineStyle = qBound(1, object["lineStyle"].toInt(1), 3);
-    item.shape = qBound(0, object["shape"].toInt(), 2);
+    item.shape = qBound(0, object["shape"].toInt(), 3);
     item.arrowStyle = qBound(0, object["arrowStyle"].toInt(), 3);
     item.number = object["number"].toInt(1);
     item.text = object["text"].toString();
@@ -120,12 +126,25 @@ QImage gaussianBlur(const QImage &source, int radius) {
 namespace {
 QPainterPath effectPath(const Annotation &item) {
     QPainterPath path;
+    if (item.shape == 3 && !item.points.isEmpty()) {
+        path.moveTo(item.points.first());
+        for (int i = 1; i < item.points.size(); ++i)
+            path.lineTo(item.points[i]);
+        QPainterPathStroker stroke;
+        stroke.setWidth(item.width);
+        stroke.setCapStyle(Qt::RoundCap);
+        stroke.setJoinStyle(Qt::RoundJoin);
+        QPainterPath result = stroke.createStroke(path);
+        result.setFillRule(Qt::WindingFill);
+        result.addEllipse(item.points.first(), item.width / 2, item.width / 2);
+        return result;
+    }
     QRectF rect = item.rect.normalized();
     if (item.shape == 2) {
         const qreal size = qMin(rect.width(), rect.height());
         rect.setSize(QSizeF(size, size));
     }
-    if (item.shape)
+    if (item.shape == 1 || item.shape == 2)
         path.addEllipse(rect);
     else
         path.addRect(rect);
@@ -159,7 +178,8 @@ QImage Document::render(bool frame) const {
         transform.translate(rect.center().x(), rect.center().y());
         transform.rotate(item.rotation);
         transform.translate(-rect.center().x(), -rect.center().y());
-        const QRect effectRegion = transform.mapRect(rect).toAlignedRect().intersected(canvas.rect());
+        const QRect effectRegion = transform.map(effectPath(item)).boundingRect().toAlignedRect()
+                                       .intersected(canvas.rect());
         QRect sampleRegion = effectRegion;
         if (item.tool == Tool::Magnify && !effectRegion.isEmpty()) {
             const QSize size(qMax(1, effectRegion.width() / 2), qMax(1, effectRegion.height() / 2));
@@ -304,12 +324,15 @@ QJsonObject Document::toJson() const {
     QJsonArray elements;
     for (const auto &rect : detectedElements)
         elements.append(QJsonArray{rect.x(), rect.y(), rect.width(), rect.height()});
-    return {{"version", 1}, {"radius", cornerRadius}, {"annotations", items}, {"elements", elements}};
+    return {{"version", 1}, {"radius", cornerRadius}, {"annotations", items}, {"elements", elements},
+            {"sourceRect", QJsonArray{sourceRect.x(), sourceRect.y(), sourceRect.width(), sourceRect.height()}}};
 }
 Document Document::fromJson(const QJsonObject &object, const QImage &image) {
     Document document;
     document.image = image;
     document.cornerRadius = qMax(0, object["radius"].toInt());
+    const auto source = object["sourceRect"].toArray();
+    document.sourceRect = QRect(source[0].toInt(), source[1].toInt(), source[2].toInt(), source[3].toInt());
     for (const auto &item : object["annotations"].toArray())
         document.annotations.append(Annotation::fromJson(item.toObject()));
     for (const auto &item : object["elements"].toArray()) {

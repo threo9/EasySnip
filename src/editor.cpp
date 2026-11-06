@@ -6,6 +6,23 @@
 #include <QOpenGLWidget>
 
 namespace {
+QTransform annotationTransform(const Annotation &item) {
+    QTransform transform;
+    transform.translate(item.rect.center().x(), item.rect.center().y());
+    transform.rotate(item.rotation);
+    transform.translate(-item.rect.center().x(), -item.rect.center().y());
+    return transform;
+}
+
+QVector<QPointF> controlCorners(const Annotation &item) {
+    const QRectF bounds = item.points.isEmpty() ? item.rect.normalized() : item.bounds();
+    return {bounds.topLeft(), bounds.topRight(), bounds.bottomRight(), bounds.bottomLeft()};
+}
+
+QPointF rotationHandle(const Annotation &item, double zoom) {
+    return QPointF(item.rect.center().x(), item.bounds().top() - 24 / zoom);
+}
+
 class AcceleratedPreview final : public QOpenGLWidget {
   public:
     AcceleratedPreview(QWidget *parent, std::function<void(QPainter &)> paint)
@@ -61,11 +78,13 @@ void AnnotationCanvas::setTool(Tool tool) {
     tool_ = tool;
     selected_ = -1;
     style_.color = settings_.toolColor(toolKey(tool));
+    style_.shape = settings_.value("annotation/shape/" + toolKey(tool), tool == Tool::Highlighter ? 3 : 0).toInt();
     if (tool == Tool::Highlighter && !settings_.value("colors/" + toolKey(tool)).isValid())
         style_.color.setAlpha(100);
     picker_ = false;
     setCursor(tool == Tool::Select ? Qt::ArrowCursor : Qt::CrossCursor);
     emit selectionChanged();
+    emit toolChanged(tool_);
     update();
     setFocus();
 }
@@ -76,6 +95,8 @@ void AnnotationCanvas::setStyle(const Annotation &style) {
     style_ = style;
     settings_.setToolColor(toolKey(selected_ >= 0 ? document_.annotations[selected_].tool : tool_),
                            style.color);
+    settings_.set("annotation/shape/" + toolKey(selected_ >= 0 ? document_.annotations[selected_].tool : tool_),
+                  style.shape);
     if (selected_ >= 0) {
         checkpoint();
         auto &item = document_.annotations[selected_];
@@ -85,15 +106,17 @@ void AnnotationCanvas::setStyle(const Annotation &style) {
         item.width = style.width;
         item.fontSize = style.fontSize;
         item.outlineWidth = style.outlineWidth;
-        item.rotation = style.rotation;
+        if (!isLineTool(item.tool))
+            item.rotation = style.rotation;
         item.lineStyle = style.lineStyle;
         item.shape = style.shape;
         item.arrowStyle = style.arrowStyle;
         redraw();
     }
+    emit selectionChanged();
 }
 void AnnotationCanvas::setZoom(double zoom) {
-    zoom_ = qBound(0.05, zoom, 8.0);
+    zoom_ = qBound(0.0001, zoom, 8.0);
     setFixedSize(qMax(1, qRound(document_.image.width() * zoom_)),
                  qMax(1, qRound(document_.image.height() * zoom_)));
     if (gpuPreview_)
@@ -111,6 +134,29 @@ void AnnotationCanvas::setBaseImage(const QImage &image) {
         document_.image = image;
         redraw();
     }
+}
+void AnnotationCanvas::setCaptureBackground(const Document &background) {
+    document_.image = background.image;
+    document_.cornerRadius = background.cornerRadius;
+    document_.detectedElements = background.detectedElements;
+    document_.sourceRect = background.sourceRect;
+    redraw();
+}
+void AnnotationCanvas::setDocument(const Document &document) {
+    document_ = document;
+    undo_.clear();
+    redo_.clear();
+    selected_ = -1;
+    drawing_ = moving_ = resizing_ = rotating_ = polyline_ = pointerDown_ = false;
+    number_ = 1;
+    for (const auto &item : document_.annotations)
+        if (item.tool == Tool::Number)
+            number_ = qMax(number_, item.number + 1);
+    redraw();
+    emit selectionChanged();
+}
+void AnnotationCanvas::setDetectedElements(const QVector<QRect> &elements) {
+    document_.detectedElements = elements;
 }
 void AnnotationCanvas::setRadius(int radius) {
     document_.cornerRadius = radius;
@@ -134,7 +180,7 @@ void AnnotationCanvas::undo() {
     redo_.append(document_.annotations);
     document_.annotations = undo_.takeLast();
     selected_ = -1;
-    drawing_ = polyline_ = moving_ = false;
+    drawing_ = polyline_ = moving_ = resizing_ = rotating_ = pointerDown_ = false;
     redraw();
     emit selectionChanged();
 }
@@ -142,10 +188,27 @@ void AnnotationCanvas::redo() {
     if (redo_.isEmpty())
         return;
     undo_.append(document_.annotations);
+    const auto previous = document_.annotations;
     document_.annotations = redo_.takeLast();
     selected_ = -1;
+    for (int i = 0; i < document_.annotations.size(); ++i)
+        if (i >= previous.size() || document_.annotations[i].toJson() != previous[i].toJson()) {
+            selected_ = i;
+            break;
+        }
+    drawing_ = polyline_ = moving_ = resizing_ = rotating_ = pointerDown_ = false;
+    if (selected_ >= 0) {
+        tool_ = document_.annotations[selected_].tool;
+        emit toolChanged(tool_);
+    }
     redraw();
     emit selectionChanged();
+}
+bool AnnotationCanvas::canUndo() const {
+    return !undo_.isEmpty();
+}
+bool AnnotationCanvas::canRedo() const {
+    return !redo_.isEmpty();
 }
 void AnnotationCanvas::clear() {
     if (document_.annotations.isEmpty())
@@ -178,6 +241,7 @@ void AnnotationCanvas::pasteObject() {
     document_.annotations.append(item);
     selected_ = document_.annotations.size() - 1;
     tool_ = Tool::Select;
+    emit toolChanged(tool_);
     redraw();
     emit selectionChanged();
 }
@@ -187,6 +251,7 @@ void AnnotationCanvas::deleteObject() {
     checkpoint();
     document_.annotations.removeAt(selected_);
     selected_ = -1;
+    drawing_ = polyline_ = moving_ = resizing_ = rotating_ = pointerDown_ = false;
     redraw();
     emit selectionChanged();
 }
@@ -197,11 +262,17 @@ void AnnotationCanvas::togglePicker() {
 }
 void AnnotationCanvas::finishDrawing() {
     if (polyline_) {
+        auto &points = document_.annotations.last().points;
+        if (points.size() > 2)
+            points.removeLast(); // The last point follows the cursor until the next click.
         polyline_ = drawing_ = false;
         selected_ = document_.annotations.size() - 1;
         redraw();
         emit selectionChanged();
     }
+}
+bool AnnotationCanvas::drawing() const {
+    return drawing_ || polyline_;
 }
 QPointF AnnotationCanvas::imagePoint(const QPoint &point) const {
     return QPointF(qBound(0.0, point.x() / zoom_, double(document_.image.width() - 1)),
@@ -212,14 +283,12 @@ void AnnotationCanvas::translate(Annotation &item, const QPointF &delta) {
     for (auto &point : item.points)
         point += delta;
 }
-int AnnotationCanvas::objectAt(const QPointF &point) const {
+int AnnotationCanvas::objectAt(const QPointF &point, bool sameTool) const {
     for (int i = document_.annotations.size() - 1; i >= 0; --i) {
         const auto &item = document_.annotations[i];
-        QTransform transform;
-        transform.translate(item.rect.center().x(), item.rect.center().y());
-        transform.rotate(item.rotation);
-        transform.translate(-item.rect.center().x(), -item.rect.center().y());
-        const QPointF local = transform.inverted().map(point);
+        if (sameTool && item.tool != tool_)
+            continue;
+        const QPointF local = annotationTransform(item).inverted().map(point);
         if (!item.points.isEmpty()) {
             QPainterPath path;
             path.moveTo(item.points.first());
@@ -255,16 +324,21 @@ void AnnotationCanvas::paintContent(QPainter &painter) {
         painter.translate(item.rect.center());
         painter.rotate(item.rotation);
         painter.translate(-item.rect.center());
-        const QRectF bounds = item.bounds();
+        const QRectF bounds = item.points.isEmpty() ? item.rect.normalized() : item.bounds();
         painter.setPen(QPen(QColor("#54d6b0"), 1 / zoom_, Qt::DashLine));
         painter.setBrush(Qt::NoBrush);
         painter.drawRect(bounds);
         painter.setBrush(QColor("#54d6b0"));
-        painter.drawRect(
-            QRectF(bounds.bottomRight() - QPointF(4 / zoom_, 4 / zoom_), QSizeF(8 / zoom_, 8 / zoom_)));
+        for (const auto &corner : controlCorners(item))
+            painter.drawRect(QRectF(corner - QPointF(4 / zoom_, 4 / zoom_), QSizeF(8 / zoom_, 8 / zoom_)));
+        if (!isLineTool(item.tool)) {
+            const QPointF handle = rotationHandle(item, zoom_);
+            painter.drawLine(QPointF(bounds.center().x(), bounds.top()), handle);
+            painter.drawEllipse(handle, 5 / zoom_, 5 / zoom_);
+        }
         painter.restore();
     }
-    if (picker_ && rendered_.rect().contains(hover_.toPoint())) {
+    if ((picker_ || magnifier_) && rendered_.rect().contains(hover_.toPoint())) {
         painter.resetTransform();
         const QPoint at = (hover_ * zoom_).toPoint();
         const QRect target(qBound(0, at.x() + 20, qMax(0, width() - 176)),
@@ -282,13 +356,23 @@ void AnnotationCanvas::paintContent(QPainter &painter) {
 }
 void AnnotationCanvas::mousePressEvent(QMouseEvent *event) {
     setFocus();
+    if (event->modifiers().testFlag(Qt::AltModifier))
+        altUsed_ = true;
     if (event->button() == Qt::RightButton) {
-        finishDrawing();
+        if (drawing() || selected_ >= 0) {
+            finishDrawing();
+            selected_ = -1;
+            drawing_ = moving_ = resizing_ = rotating_ = pointerDown_ = false;
+            emit selectionChanged();
+            update();
+        } else
+            matchElement(imagePoint(event->pos()));
         return;
     }
     if (event->button() != Qt::LeftButton)
         return;
     const QPointF point = imagePoint(event->pos());
+    hover_ = point;
     if (picker_) {
         const QString text = colorText(rendered_.pixelColor(point.toPoint()),
                                        settings_.value("color/format", "HEX").toString(),
@@ -298,32 +382,46 @@ void AnnotationCanvas::mousePressEvent(QMouseEvent *event) {
         return;
     }
     if (polyline_) {
-        document_.annotations.last().points.append(point);
+        auto &points = document_.annotations.last().points;
+        points.last() = point;
+        points.append(point);
+        pointerDown_ = true;
+        previous_ = point;
         redraw();
         return;
     }
     anchor_ = previous_ = point;
     penStraight_ = false;
-    if (tool_ == Tool::Select) {
-        resizing_ = false;
-        if (selected_ >= 0) {
-            const auto &item = document_.annotations[selected_];
-            QTransform transform;
-            transform.translate(item.rect.center().x(), item.rect.center().y());
-            transform.rotate(item.rotation);
-            transform.translate(-item.rect.center().x(), -item.rect.center().y());
-            resizing_ = QLineF(point, transform.map(item.bounds().bottomRight())).length() < 12 / zoom_;
-        }
-        if (!resizing_)
-            selected_ = objectAt(point);
+    pointerDown_ = true;
+    resizeCorner_ = -1;
+    resizing_ = rotating_ = false;
+    if (selected_ >= 0) {
+        const auto &item = document_.annotations[selected_];
+        const QTransform transform = annotationTransform(item);
+        const auto corners = controlCorners(item);
+        for (int i = 0; i < corners.size(); ++i)
+            if (QLineF(point, transform.map(corners[i])).length() < 10 / zoom_)
+                resizeCorner_ = i;
+        resizing_ = resizeCorner_ >= 0;
+        rotating_ = !isLineTool(item.tool) &&
+                    QLineF(point, transform.map(rotationHandle(item, zoom_))).length() < 10 / zoom_;
+    }
+    const int hit = objectAt(point, tool_ != Tool::Select);
+    if (tool_ == Tool::Select || resizing_ || rotating_ || hit >= 0) {
+        if (!resizing_ && !rotating_)
+            selected_ = hit;
         if (selected_ >= 0) {
             checkpoint();
-            if (event->modifiers().testFlag(Qt::AltModifier)) {
+            if (!resizing_ && !rotating_ &&
+                (event->modifiers().testFlag(Qt::ControlModifier) ||
+                 event->modifiers().testFlag(Qt::AltModifier))) {
                 document_.annotations.append(document_.annotations[selected_]);
                 selected_ = document_.annotations.size() - 1;
             }
             original_ = document_.annotations[selected_];
-            moving_ = !resizing_;
+            if (resizing_ && original_.tool == Tool::Text && event->modifiers().testFlag(Qt::ShiftModifier))
+                original_.rotation = 0;
+            moving_ = !resizing_ && !rotating_;
         }
         emit selectionChanged();
         update();
@@ -334,27 +432,8 @@ void AnnotationCanvas::mousePressEvent(QMouseEvent *event) {
     item.rotation = 0;
     item.points.clear();
     item.rect = QRectF(point, QSizeF(1, 1));
-    const bool canMatch = tool_ == Tool::Rectangle || tool_ == Tool::RoundedRectangle ||
-                          tool_ == Tool::Ellipse || tool_ == Tool::Highlighter || tool_ == Tool::Mosaic ||
-                          tool_ == Tool::Blur || tool_ == Tool::Eraser;
-    if (canMatch && event->modifiers().testFlag(Qt::ControlModifier)) {
-        QRect match;
-        for (const auto &element : document_.detectedElements) {
-            if (element.contains(point.toPoint()) &&
-                (match.isEmpty() ||
-                 qint64(element.width()) * element.height() < qint64(match.width()) * match.height()))
-                match = element;
-        }
-        if (!match.isEmpty()) {
-            item.rect = match;
-            checkpoint();
-            document_.annotations.append(item);
-            selected_ = document_.annotations.size() - 1;
-            redraw();
-            emit selectionChanged();
-            return;
-        }
-    }
+    if (event->modifiers().testFlag(Qt::ControlModifier) && matchElement(point))
+        return;
     if (tool_ == Tool::Text) {
         bool ok = false;
         item.text = QInputDialog::getMultiLineText(this, QStringLiteral("添加文字"),
@@ -375,15 +454,39 @@ void AnnotationCanvas::mousePressEvent(QMouseEvent *event) {
         item.number = number_++;
     } else {
         drawing_ = true;
-        if (tool_ == Tool::Line || tool_ == Tool::Arrow || tool_ == Tool::Pen || tool_ == Tool::Polyline)
+        if (isLineTool(tool_) || tool_ == Tool::Pen || (isEffectTool(tool_) && item.shape == 3))
             item.points = {point, point};
         polyline_ = tool_ == Tool::Polyline;
+        polylineDragged_ = false;
     }
     checkpoint();
     document_.annotations.append(item);
     selected_ = document_.annotations.size() - 1;
     redraw();
     emit selectionChanged();
+}
+bool AnnotationCanvas::matchElement(const QPointF &point) {
+    if (tool_ != Tool::Rectangle && tool_ != Tool::RoundedRectangle && tool_ != Tool::Ellipse &&
+        !(isEffectTool(tool_) && style_.shape == 0))
+        return false;
+    QRect match;
+    for (const auto &element : document_.detectedElements)
+        if (element.contains(point.toPoint()) &&
+            (match.isEmpty() || qint64(element.width()) * element.height() < qint64(match.width()) * match.height()))
+            match = element;
+    if (match.isEmpty())
+        return false;
+    Annotation item = style_;
+    item.tool = tool_;
+    item.rect = match;
+    item.points.clear();
+    item.rotation = 0;
+    checkpoint();
+    document_.annotations.append(item);
+    selected_ = document_.annotations.size() - 1;
+    redraw();
+    emit selectionChanged();
+    return true;
 }
 void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
     const QPointF point = imagePoint(event->pos());
@@ -393,35 +496,61 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
                              .arg(qRound(point.y()))
                              .arg(rendered_.pixelColor(point.toPoint()).name().toUpper()));
     if (selected_ < 0) {
-        if (picker_)
+        if (picker_ || magnifier_)
             update();
         return;
     }
     auto &item = document_.annotations[selected_];
     if (moving_)
         translate(item, point - previous_);
-    else if (resizing_) {
-        const QRectF old = original_.bounds();
-        const double sx = qMax(0.05, (point.x() - old.left()) / qMax(1.0, old.width()));
-        const double sy = event->modifiers().testFlag(Qt::ShiftModifier)
-                              ? sx
-                              : qMax(0.05, (point.y() - old.top()) / qMax(1.0, old.height()));
+    else if (rotating_) {
+        const QPointF center = original_.rect.center();
+        const QPointF start = anchor_ - center, end = point - center;
+        double angle = original_.rotation +
+            (std::atan2(end.y(), end.x()) - std::atan2(start.y(), start.x())) * 180 / M_PI;
+        if (event->modifiers().testFlag(Qt::ShiftModifier))
+            angle = qRound(angle / 15) * 15;
+        item.rotation = std::remainder(angle, 360.0);
+    } else if (resizing_) {
+        if (original_.tool == Tool::Text && event->modifiers().testFlag(Qt::ShiftModifier))
+            original_.rotation = 0;
+        const auto corners = controlCorners(original_);
+        const QPointF fixed = corners[(resizeCorner_ + 2) % 4];
+        const QTransform transform = annotationTransform(original_);
+        const QPointF local = transform.inverted().map(point);
+        const QPointF diagonal = corners[resizeCorner_] - fixed;
+        double sx = qAbs(diagonal.x()) < 0.01 ? 1 : qMax(0.05, (local.x() - fixed.x()) / diagonal.x());
+        double sy = qAbs(diagonal.y()) < 0.01 ? 1 : qMax(0.05, (local.y() - fixed.y()) / diagonal.y());
+        if (original_.tool == Tool::Text || event->modifiers().testFlag(Qt::ShiftModifier)) {
+            const double lengthSquared = QPointF::dotProduct(diagonal, diagonal);
+            sx = sy = qMax(0.05, QPointF::dotProduct(local - fixed, diagonal) / qMax(1.0, lengthSquared));
+        }
+        if (original_.tool == Tool::Text)
+            sx = sy = qBound(6.0, original_.fontSize * sx, 300.0) / original_.fontSize;
+        auto scalePoint = [&](const QPointF &p) {
+            return fixed + QPointF((p.x() - fixed.x()) * sx, (p.y() - fixed.y()) * sy);
+        };
         item = original_;
-        item.rect.setSize(QSizeF(original_.rect.width() * sx, original_.rect.height() * sy));
+        item.rect = QRectF(scalePoint(original_.rect.topLeft()), scalePoint(original_.rect.bottomRight())).normalized();
         for (auto &p : item.points)
-            p = old.topLeft() + QPointF((p.x() - old.left()) * sx, (p.y() - old.top()) * sy);
+            p = scalePoint(p);
+        if (item.tool == Tool::Text)
+            item.fontSize = original_.fontSize * sx;
+        translate(item, transform.map(fixed) - annotationTransform(item).map(fixed));
     } else if (drawing_ || polyline_) {
         QPointF end = point;
-        if (item.tool == Tool::Pen) {
+        const bool brush = item.tool == Tool::Pen || (isEffectTool(item.tool) && item.shape == 3);
+        if (polyline_ && pointerDown_ && QLineF(anchor_, point).length() > 3 / zoom_)
+            polylineDragged_ = true;
+        if (brush) {
             const bool straight = event->modifiers().testFlag(Qt::ShiftModifier);
             if (straight && !penStraight_)
                 item.points.append(point);
             penStraight_ = straight;
         }
         if (event->modifiers().testFlag(Qt::ShiftModifier)) {
-            if (item.tool == Tool::Line || item.tool == Tool::Arrow || item.tool == Tool::Polyline ||
-                item.tool == Tool::Pen) {
-                const QPointF start = (item.tool == Tool::Polyline || item.tool == Tool::Pen)
+            if (isLineTool(item.tool) || brush) {
+                const QPointF start = (item.tool == Tool::Polyline || brush)
                                           ? item.points[item.points.size() - 2]
                                           : anchor_;
                 const QLineF line(start, point);
@@ -434,13 +563,23 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
                                         point.y() >= anchor_.y() ? side : -side);
             }
         }
-        if (item.tool == Tool::Pen && !event->modifiers().testFlag(Qt::ShiftModifier))
+        if (brush && !event->modifiers().testFlag(Qt::ShiftModifier))
             item.points.append(end);
         else if (!item.points.isEmpty())
             item.points.last() = end;
         item.rect = QRectF(anchor_, end).normalized();
+        if (!item.points.isEmpty()) {
+            QRectF bounds(item.points.first(), QSizeF(0, 0));
+            for (const auto &p : item.points) {
+                bounds.setLeft(qMin(bounds.left(), p.x()));
+                bounds.setRight(qMax(bounds.right(), p.x()));
+                bounds.setTop(qMin(bounds.top(), p.y()));
+                bounds.setBottom(qMax(bounds.bottom(), p.y()));
+            }
+            item.rect = bounds;
+        }
     } else {
-        if (picker_)
+        if (picker_ || magnifier_)
             update();
         return;
     }
@@ -450,7 +589,9 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
 void AnnotationCanvas::mouseReleaseEvent(QMouseEvent *event) {
     if (event->button() != Qt::LeftButton)
         return;
-    moving_ = resizing_ = false;
+    moving_ = resizing_ = rotating_ = pointerDown_ = false;
+    if (polyline_ && polylineDragged_ && document_.annotations.last().points.size() == 2)
+        polyline_ = false;
     if (!polyline_) {
         drawing_ = false;
         if (!settings_.value("annotation/selectNew", true).toBool() && tool_ != Tool::Select)
@@ -460,13 +601,17 @@ void AnnotationCanvas::mouseReleaseEvent(QMouseEvent *event) {
     emit selectionChanged();
 }
 void AnnotationCanvas::mouseDoubleClickEvent(QMouseEvent *event) {
+    if (event->button() != Qt::LeftButton)
+        return;
     if (polyline_) {
         finishDrawing();
         return;
     }
     const int index = objectAt(imagePoint(event->pos()));
-    if (index < 0 || document_.annotations[index].tool != Tool::Text)
+    if (index < 0 || document_.annotations[index].tool != Tool::Text) {
+        emit imageCopyRequested();
         return;
+    }
     bool ok = false;
     const QString text = QInputDialog::getMultiLineText(
         this, QStringLiteral("编辑文字"), QStringLiteral("文字内容"), document_.annotations[index].text, &ok);
@@ -477,6 +622,41 @@ void AnnotationCanvas::mouseDoubleClickEvent(QMouseEvent *event) {
     }
 }
 void AnnotationCanvas::keyPressEvent(QKeyEvent *event) {
+    if (event->key() == Qt::Key_Alt) {
+        if (!event->isAutoRepeat())
+            altUsed_ = false;
+        return;
+    }
+    if (event->modifiers().testFlag(Qt::AltModifier))
+        altUsed_ = true;
+    if ((picker_ || magnifier_) && event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
+        settings_.set("color/format", settings_.value("color/format", "HEX") == "RGB" ? "HEX" : "RGB");
+        update();
+        return;
+    }
+    if ((picker_ || magnifier_) && event->key() == Qt::Key_C && event->modifiers() == Qt::NoModifier) {
+        const QString text = colorText(rendered_.pixelColor(hover_.toPoint()),
+                                      settings_.value("color/format", "HEX").toString(),
+                                      settings_.value("color/uppercase", true).toBool());
+        QApplication::clipboard()->setText(text);
+        emit colorPicked(text);
+        return;
+    }
+    if (settings_.value("input/wasd", true).toBool() && event->modifiers() == Qt::NoModifier) {
+        QPoint step;
+        if (event->key() == Qt::Key_W) step.setY(-1);
+        if (event->key() == Qt::Key_A) step.setX(-1);
+        if (event->key() == Qt::Key_S) step.setY(1);
+        if (event->key() == Qt::Key_D) step.setX(1);
+        if (!step.isNull()) {
+            const QPoint local = (hover_ * zoom_).toPoint() + step;
+            QCursor::setPos(mapToGlobal(local));
+            QMouseEvent move(QEvent::MouseMove, QPointF(local), Qt::NoButton,
+                             pointerDown_ ? Qt::LeftButton : Qt::NoButton, event->modifiers());
+            mouseMoveEvent(&move);
+            return;
+        }
+    }
     if (event->matches(QKeySequence::Undo)) {
         undo();
         return;
@@ -485,11 +665,12 @@ void AnnotationCanvas::keyPressEvent(QKeyEvent *event) {
         redo();
         return;
     }
-    if (event->matches(QKeySequence::Copy) && selected_ >= 0) {
+    if (event->key() == Qt::Key_C && event->modifiers() == (Qt::ControlModifier | Qt::ShiftModifier)) {
         copyObject();
         return;
     }
-    if (event->matches(QKeySequence::Paste)) {
+    if ((event->key() == Qt::Key_V && event->modifiers() == (Qt::ControlModifier | Qt::ShiftModifier)) ||
+        event->matches(QKeySequence::Paste)) {
         pasteObject();
         return;
     }
@@ -503,13 +684,27 @@ void AnnotationCanvas::keyPressEvent(QKeyEvent *event) {
         update();
         return;
     }
-    if (event->key() == Qt::Key_Return) {
+    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
         finishDrawing();
         return;
     }
-    if (event->key() == Qt::Key_BracketLeft || event->key() == Qt::Key_BracketRight) {
+    if (event->key() == Qt::Key_Tab && (tool_ == Tool::Line || tool_ == Tool::Arrow || tool_ == Tool::Polyline)) {
+        tool_ = tool_ == Tool::Arrow ? Tool::Line : Tool::Arrow;
+        if (selected_ >= 0 && isLineTool(document_.annotations[selected_].tool)) {
+            if (!drawing())
+                checkpoint();
+            document_.annotations[selected_].tool = tool_;
+            redraw();
+        }
+        emit toolChanged(tool_);
+        emit selectionChanged();
+        return;
+    }
+    if (event->key() == Qt::Key_BracketLeft || event->key() == Qt::Key_BracketRight ||
+        event->key() == Qt::Key_1 || event->key() == Qt::Key_2) {
         auto next = style();
-        next.width = qBound(1.0, next.width + (event->key() == Qt::Key_BracketLeft ? -1 : 1), 100.0);
+        next.width = qBound(1.0, next.width +
+            (event->key() == Qt::Key_BracketLeft || event->key() == Qt::Key_1 ? -1 : 1), 100.0);
         setStyle(next);
         emit selectionChanged();
         return;
@@ -532,6 +727,24 @@ void AnnotationCanvas::keyPressEvent(QKeyEvent *event) {
     }
     QWidget::keyPressEvent(event);
 }
+void AnnotationCanvas::keyReleaseEvent(QKeyEvent *event) {
+    if (event->key() == Qt::Key_Alt) {
+        if (!event->isAutoRepeat() && !altUsed_) {
+            magnifier_ = !magnifier_;
+            update();
+        }
+        return;
+    }
+    QWidget::keyReleaseEvent(event);
+}
+bool AnnotationCanvas::event(QEvent *event) {
+    if (event->type() == QEvent::KeyPress && static_cast<QKeyEvent *>(event)->key() == Qt::Key_Tab &&
+        isLineTool(tool_)) {
+        keyPressEvent(static_cast<QKeyEvent *>(event));
+        return true;
+    }
+    return QWidget::event(event);
+}
 void AnnotationCanvas::wheelEvent(QWheelEvent *event) {
     if (event->modifiers().testFlag(Qt::ControlModifier))
         setZoom(zoom_ * (event->angleDelta().y() > 0 ? 1.1 : 1 / 1.1));
@@ -540,6 +753,136 @@ void AnnotationCanvas::wheelEvent(QWheelEvent *event) {
         next.width = qBound(1.0, next.width + (event->angleDelta().y() > 0 ? 1 : -1), 100.0);
         setStyle(next);
         emit selectionChanged();
+    }
+}
+
+BrushTips::BrushTips(AnnotationCanvas *canvas, Settings &settings, QWidget *parent)
+    : QWidget(parent), canvas_(canvas), settings_(settings) {
+    auto *row = new QHBoxLayout(this);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(2);
+    for (const auto &part : settings.value("annotation/tips", "2,4,8").toString().split(',')) {
+        bool ok = false;
+        const double value = part.toDouble(&ok);
+        if (ok && value >= 1 && value <= 100 && sizes_.size() < 5)
+            sizes_.append(value);
+    }
+    if (sizes_.isEmpty())
+        sizes_.append(3);
+    rebuild();
+}
+void BrushTips::save() {
+    QStringList values;
+    for (double size : sizes_)
+        values.append(QString::number(size));
+    settings_.set("annotation/tips", values.join(','));
+}
+void BrushTips::rebuild() {
+    while (auto *item = layout()->takeAt(0)) {
+        item->widget()->hide();
+        item->widget()->deleteLater();
+        delete item;
+    }
+    for (int i = 0; i < sizes_.size(); ++i) {
+        auto *button = new QToolButton(this);
+        button->setText(QString::number(sizes_[i]));
+        button->setStyleSheet("QToolButton { padding:3px; }");
+        button->setToolTip(QStringLiteral("选择笔尖，滚轮单独调整粗细"));
+        button->setProperty("tipIndex", i);
+        button->setFocusPolicy(Qt::NoFocus);
+        button->installEventFilter(this);
+        layout()->addWidget(button);
+        connect(button, &QToolButton::clicked, this, [this, i] {
+            auto next = canvas_->style();
+            next.width = sizes_[i];
+            canvas_->setStyle(next);
+        });
+    }
+    auto *edit = new QToolButton(this);
+    edit->setText(QStringLiteral("…"));
+    edit->setToolTip(QStringLiteral("编辑 1–5 个笔尖"));
+    edit->setStyleSheet("QToolButton { padding:3px; }");
+    layout()->addWidget(edit);
+    connect(edit, &QToolButton::clicked, this, [this] {
+        bool ok = false;
+        const QString value = QInputDialog::getText(this, QStringLiteral("笔尖预设"),
+            QStringLiteral("输入 1–5 个粗细（1–100），用逗号分隔"), QLineEdit::Normal,
+            settings_.value("annotation/tips", "2,4,8").toString(), &ok);
+        if (!ok)
+            return;
+        QVector<double> sizes;
+        for (const auto &part : value.split(',')) {
+            bool valid = false;
+            const double number = part.toDouble(&valid);
+            if (!valid || number < 1 || number > 100 || sizes.size() == 5) {
+                QMessageBox::warning(this, QStringLiteral("笔尖预设"), QStringLiteral("请输入 1–5 个 1–100 的数值。"));
+                return;
+            }
+            sizes.append(number);
+        }
+        sizes_ = sizes;
+        save();
+        rebuild();
+    });
+}
+bool BrushTips::eventFilter(QObject *object, QEvent *event) {
+    if (event->type() == QEvent::Wheel && object->property("tipIndex").isValid()) {
+        auto *wheel = static_cast<QWheelEvent *>(event);
+        const int index = object->property("tipIndex").toInt();
+        if (!wheel->angleDelta().y())
+            return true;
+        sizes_[index] = qBound(1.0, sizes_[index] + (wheel->angleDelta().y() > 0 ? 1 : -1), 100.0);
+        static_cast<QToolButton *>(object)->setText(QString::number(sizes_[index]));
+        save();
+        auto next = canvas_->style();
+        next.width = sizes_[index];
+        canvas_->setStyle(next);
+        return true;
+    }
+    return QWidget::eventFilter(object, event);
+}
+
+PaletteWidget::PaletteWidget(AnnotationCanvas *canvas, Settings &settings, QWidget *parent)
+    : QListWidget(parent), canvas_(canvas), settings_(settings) {
+    setObjectName("annotationPalette");
+    setViewMode(QListView::ListMode);
+    setFlow(QListView::LeftToRight);
+    setWrapping(true);
+    setIconSize(QSize(uiPixels(18), uiPixels(18)));
+    setGridSize(QSize(uiPixels(28), uiPixels(28)));
+    setStyleSheet("QListWidget::item { padding:2px; }");
+    setFixedHeight(uiPixels(60));
+    setDragDropMode(QAbstractItemView::InternalMove);
+    setDefaultDropAction(Qt::MoveAction);
+    reload();
+    connect(this, &QListWidget::itemClicked, this, [this](QListWidgetItem *item) {
+        auto next = canvas_->style();
+        const QColor color(item->data(Qt::UserRole).toString());
+        next.color = color;
+        canvas_->setStyle(next);
+    });
+    connect(model(), &QAbstractItemModel::rowsMoved, this, &PaletteWidget::saveOrder);
+}
+void PaletteWidget::saveOrder() {
+    QStringList colors;
+    for (int i = 0; i < count(); ++i)
+        colors.append(item(i)->data(Qt::UserRole).toString());
+    settings_.set("annotation/palette", colors);
+}
+void PaletteWidget::dropEvent(QDropEvent *event) {
+    QListWidget::dropEvent(event);
+    if (event->isAccepted())
+        QTimer::singleShot(0, this, &PaletteWidget::saveOrder);
+}
+void PaletteWidget::reload() {
+    clear();
+    for (const auto &color : settings_.palette()) {
+        QPixmap swatch(uiPixels(18), uiPixels(18));
+        swatch.fill(QColor(color));
+        auto *entry = new QListWidgetItem(QIcon(swatch), "", this);
+        entry->setData(Qt::UserRole, color);
+        entry->setToolTip(color);
+        entry->setFlags(entry->flags() & ~Qt::ItemIsDropEnabled);
     }
 }
 
@@ -565,22 +908,24 @@ EditorWindow::EditorWindow(Document document, Settings &settings, const QRect &s
         connect(button, &QPushButton::clicked, this, [this, name] {
             canvas_->finishDrawing();
             const bool skip = QApplication::keyboardModifiers().testFlag(Qt::AltModifier);
-            emit outputRequested(canvas_->document(), name, skip);
+            const bool quick = name == "save-as" && QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier);
+            emit outputRequested(canvas_->document(), quick ? "save" : name, skip);
         });
         if (!shortcut.isEmpty()) {
             auto *key = new QShortcut(QKeySequence(shortcut), this);
             connect(key, &QShortcut::activated, this, [this, button, name] {
-                if (name == "copy" && canvas_->hasFocus() && canvas_->selectedIndex() >= 0)
-                    canvas_->copyObject();
-                else
-                    button->click();
+                button->click();
             });
         }
         return button;
     };
     action(QStringLiteral("复制图像"), "copy", settings.value("keys/copy", "Ctrl+C").toString());
     action(QStringLiteral("另存为"), "save-as", settings.value("keys/save", "Ctrl+S").toString());
-    action(QStringLiteral("贴到屏幕"), "pin", settings.value("keys/pin", "Ctrl+P").toString());
+    auto *quickSaveKey = new QShortcut(QKeySequence("Ctrl+Shift+S"), this);
+    connect(quickSaveKey, &QShortcut::activated, this, [this] {
+        canvas_->finishDrawing();
+        emit outputRequested(canvas_->document(), "save", false);
+    });
     auto *more = new QPushButton(QStringLiteral("更多"));
     top->addWidget(more);
     more->setVisible(settings_.value("output/menuVisible", true).toBool());
@@ -655,34 +1000,15 @@ EditorWindow::EditorWindow(Document document, Settings &settings, const QRect &s
     auto *label = new QLabel(QStringLiteral("画笔与对象"));
     label->setStyleSheet(QString("font-size:%1px; font-weight:600").arg(uiPixels(17)));
     form->addRow(label);
-    palette_ = new QListWidget;
-    palette_->setViewMode(QListView::IconMode);
-    palette_->setIconSize(QSize(uiPixels(24), uiPixels(24)));
-    palette_->setGridSize(QSize(uiPixels(36), uiPixels(38)));
-    palette_->setFixedHeight(uiPixels(88));
-    palette_->setMovement(QListView::Snap);
-    palette_->setDragDropMode(QAbstractItemView::InternalMove);
-    palette_->setFlow(QListView::LeftToRight);
-    palette_->setWrapping(true);
-    for (const auto &color : settings.palette()) {
-        QPixmap swatch(24, 24);
-        swatch.fill(QColor(color));
-        auto *item = new QListWidgetItem(QIcon(swatch), "", palette_);
-        item->setData(Qt::UserRole, color);
-    }
+    palette_ = new PaletteWidget(canvas_, settings_);
     palette_->viewport()->installEventFilter(this);
     form->addRow(palette_);
-    connect(palette_, &QListWidget::itemClicked, this, [this](QListWidgetItem *item) {
-        auto next = canvas_->style();
-        next.color = QColor(item->data(Qt::UserRole).toString());
-        next.color.setAlpha(alpha_->value());
-        canvas_->setStyle(next);
-        syncInspector();
-    });
     auto *paletteEdit = new QPushButton(QStringLiteral("定制 / 导入 / 导出色板"));
     form->addRow(paletteEdit);
     connect(paletteEdit, &QPushButton::clicked, this, &EditorWindow::editPalette);
     color_ = new QPushButton;
+    color_->setObjectName("annotationColor");
+    color_->installEventFilter(this);
     fill_ = new QPushButton(QStringLiteral("背景填充"));
     outline_ = new QPushButton(QStringLiteral("描边颜色"));
     form->addRow(QStringLiteral("颜色"), color_);
@@ -713,36 +1039,7 @@ EditorWindow::EditorWindow(Document document, Settings &settings, const QRect &s
     width_->setRange(1, 100);
     width_->setValue(3);
     form->addRow(QStringLiteral("粗细"), width_);
-    auto *tips = new QComboBox;
-    const auto presets = settings.value("annotation/tips", "2,4,8,12,20").toString().split(',');
-    for (const auto &tip : presets.mid(0, 5))
-        tips->addItem(tip + " px", tip.toDouble());
-    form->addRow(QStringLiteral("笔尖预设"), tips);
-    connect(tips, QOverload<int>::of(&QComboBox::activated), this,
-            [this, tips] { width_->setValue(tips->currentData().toDouble()); });
-    auto *saveTips = new QPushButton(QStringLiteral("编辑 1–5 个笔尖"));
-    form->addRow(saveTips);
-    connect(saveTips, &QPushButton::clicked, this, [this, tips] {
-        bool ok = false;
-        const QString value = QInputDialog::getText(
-            this, QStringLiteral("笔尖预设"), QStringLiteral("输入 1–5 个粗细（1–100），用逗号分隔"),
-            QLineEdit::Normal, settings_.value("annotation/tips", "2,4,8,12,20").toString(), &ok);
-        if (!ok)
-            return;
-        QStringList valid;
-        for (const auto &part : value.split(',')) {
-            bool number = false;
-            const double n = part.toDouble(&number);
-            if (number && n >= 1 && n <= 100 && valid.size() < 5)
-                valid.append(QString::number(n));
-        }
-        if (valid.isEmpty())
-            return;
-        settings_.set("annotation/tips", valid.join(','));
-        tips->clear();
-        for (const auto &part : valid)
-            tips->addItem(part + " px", part.toDouble());
-    });
+    form->addRow(QStringLiteral("笔尖"), new BrushTips(canvas_, settings_));
     alpha_ = new QSpinBox;
     alpha_->setRange(0, 255);
     alpha_->setValue(255);
@@ -762,7 +1059,7 @@ EditorWindow::EditorWindow(Document document, Settings &settings, const QRect &s
     lineStyle_->addItems({QStringLiteral("实线"), QStringLiteral("虚线"), QStringLiteral("点线")});
     form->addRow(QStringLiteral("线型"), lineStyle_);
     shape_ = new QComboBox;
-    shape_->addItems({QStringLiteral("矩形区域"), QStringLiteral("椭圆区域"), QStringLiteral("圆形区域")});
+    shape_->addItems({QStringLiteral("矩形区域"), QStringLiteral("椭圆区域"), QStringLiteral("圆形区域"), QStringLiteral("画笔轨迹")});
     form->addRow(QStringLiteral("效果区域"), shape_);
     arrow_ = new QComboBox;
     arrow_->addItems({QStringLiteral("单向开放"), QStringLiteral("双向"), QStringLiteral("反向"),
@@ -806,13 +1103,17 @@ EditorWindow::EditorWindow(Document document, Settings &settings, const QRect &s
         syncInspector();
     });
     connect(canvas_, &AnnotationCanvas::selectionChanged, this, &EditorWindow::syncInspector);
+    connect(canvas_, &AnnotationCanvas::toolChanged, this, [group](Tool tool) {
+        if (auto *button = group->button(int(tool)))
+            button->setChecked(true);
+    });
     connect(canvas_, &AnnotationCanvas::colorPicked, this, [this](const QString &text) {
         statusBar()->showMessage(QStringLiteral("已复制色值 ") + text, 4000);
     });
     connect(canvas_, &AnnotationCanvas::positionChanged, this, [this](const QString &text) {
         statusBar()->showMessage(
             text +
-            QStringLiteral("   ·   Shift 约束 · Alt 拖动克隆 · 滚轮粗细 · Ctrl+滚轮缩放 · 双击编辑文字"));
+            QStringLiteral("   ·   Shift 约束 · Ctrl 拖动克隆 · 滚轮粗细 · Ctrl+滚轮缩放 · 双击编辑文字"));
     });
     connect(&refreshTimer_, &QTimer::timeout, this, &EditorWindow::refreshBackground);
     QTimer::singleShot(0, this, [this, scroll] {
@@ -837,6 +1138,7 @@ void EditorWindow::syncInspector() {
     fontSize_->setValue(qRound(style.fontSize));
     outlineWidth_->setValue(qRound(style.outlineWidth));
     rotation_->setValue(style.rotation);
+    rotation_->setEnabled(!isLineTool(canvas_->selectedIndex() >= 0 ? style.tool : canvas_->tool()));
     lineStyle_->setCurrentIndex(style.lineStyle - 1);
     shape_->setCurrentIndex(style.shape);
     arrow_->setCurrentIndex(style.arrowStyle);
@@ -879,6 +1181,9 @@ void EditorWindow::refreshBackground() {
     });
 }
 void EditorWindow::editPalette() {
+    palette_->edit();
+}
+void PaletteWidget::edit() {
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("调色板"));
     dialog.resize(420, 360);
@@ -886,8 +1191,8 @@ void EditorWindow::editPalette() {
     QLabel label(QStringLiteral("每行一个 HEX 颜色，可在侧栏拖动色块排序。"));
     layout.addWidget(&label);
     QStringList colors;
-    for (int i = 0; i < palette_->count(); ++i)
-        colors.append(palette_->item(i)->data(Qt::UserRole).toString());
+    for (int i = 0; i < count(); ++i)
+        colors.append(item(i)->data(Qt::UserRole).toString());
     QPlainTextEdit edit(colors.join('\n'));
     layout.addWidget(&edit);
     QHBoxLayout files;
@@ -921,17 +1226,11 @@ void EditorWindow::editPalette() {
     colors.clear();
     for (const auto &line : edit.toPlainText().split('\n'))
         if (QColor(line.trimmed()).isValid())
-            colors.append(QColor(line.trimmed()).name());
+            colors.append(QColor(line.trimmed()).name(QColor::HexArgb));
     if (colors.isEmpty())
         return;
     settings_.set("annotation/palette", colors);
-    palette_->clear();
-    for (const auto &color : colors) {
-        QPixmap swatch(24, 24);
-        swatch.fill(QColor(color));
-        auto *item = new QListWidgetItem(QIcon(swatch), "", palette_);
-        item->setData(Qt::UserRole, color);
-    }
+    reload();
 }
 void EditorWindow::recognize() {
     statusBar()->showMessage(QStringLiteral("正在识别…"));
@@ -960,16 +1259,12 @@ void EditorWindow::recognize() {
 }
 void EditorWindow::closeEvent(QCloseEvent *event) {
     refreshTimer_.stop();
-    QStringList colors;
-    for (int i = 0; i < palette_->count(); ++i)
-        colors.append(palette_->item(i)->data(Qt::UserRole).toString());
-    settings_.set("annotation/palette", colors);
     if (!output_)
         emit abandoned(canvas_->document());
     QMainWindow::closeEvent(event);
 }
 bool EditorWindow::eventFilter(QObject *object, QEvent *event) {
-    if (object == palette_->viewport() && event->type() == QEvent::Wheel) {
+    if ((object == palette_->viewport() || object == color_) && event->type() == QEvent::Wheel) {
         const auto *wheel = static_cast<QWheelEvent *>(event);
         auto next = canvas_->style();
         next.color.setAlpha(qBound(0, next.color.alpha() + (wheel->angleDelta().y() > 0 ? 8 : -8), 255));

@@ -17,6 +17,9 @@ class Settings {
     QStringList palette() const;
     QColor toolColor(const QString &tool) const;
     void setToolColor(const QString &tool, const QColor &color);
+    QString shortcut(const QString &command) const;
+    QString action(const QString &key, const QString &fallback) const;
+    bool ignoresShortcut(const QString &command, const QString &executable) const;
     void sync();
 
   private:

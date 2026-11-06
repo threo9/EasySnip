@@ -1,7 +1,9 @@
 param(
     [string]$QtRoot = 'E:\Qt5.14.2',
     [switch]$Test,
-    [switch]$Package
+    [switch]$Package,
+    [ValidatePattern('^EasySnip(?:-[A-Za-z0-9_-]+)?$')]
+    [string]$PackageName = 'EasySnip'
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -32,17 +34,18 @@ try {
         } finally { $env:QT_QPA_PLATFORM = $previousPlatform }
     }
     if ($Package) {
-        $packageDirectory = Join-Path $projectRoot 'dist\EasySnip'
+        $packageDirectory = Join-Path $projectRoot ('dist\' + $PackageName)
         New-Item -ItemType Directory -Force -Path $packageDirectory | Out-Null
         Copy-Item -LiteralPath $executable -Destination $packageDirectory -Force
         & (Join-Path $qtBin 'windeployqt.exe') '--release' '--no-translations' '--no-system-d3d-compiler' '--no-opengl-sw' (Join-Path $packageDirectory 'EasySnip.exe')
         if ($LASTEXITCODE -ne 0) {
             Write-Warning 'windeployqt could not classify this SDK plugin set. Deploying the verified runtime dependency list.'
+            $global:LASTEXITCODE = 0
         }
         # Some Qt 5.14.2 SDKs carry PE debug information in release plugins.
         # Their imports use Qt5Core.dll/Qt5Gui.dll, but windeployqt may reject them.
         # Copy the exact modules exercised by the application and regression suite.
-        foreach ($module in @('Qt5Core.dll', 'Qt5Gui.dll', 'Qt5Widgets.dll', 'Qt5Network.dll', 'Qt5PrintSupport.dll', 'Qt5Test.dll', 'Qt5Svg.dll', 'libEGL.dll', 'libGLESv2.dll')) {
+        foreach ($module in @('Qt5Core.dll', 'Qt5Gui.dll', 'Qt5Widgets.dll', 'Qt5Network.dll', 'Qt5PrintSupport.dll', 'Qt5Concurrent.dll', 'Qt5Test.dll', 'Qt5Svg.dll', 'libEGL.dll', 'libGLESv2.dll')) {
             Copy-Item -LiteralPath (Join-Path $qtBin $module) -Destination $packageDirectory -Force
         }
         foreach ($runtime in @('libgcc_s_seh-1.dll', 'libstdc++-6.dll', 'libwinpthread-1.dll')) {
@@ -79,6 +82,6 @@ try {
             New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
             Copy-Item -Path (Join-Path $QtRoot ('Tools\mingw730_64\licenses\' + $component + '\COPYING*')) -Destination $licenseDirectory -Force
         }
-        Compress-Archive -Path $packageDirectory -DestinationPath (Join-Path $projectRoot 'dist\EasySnip-0.1.0-win64.zip') -Force
+        Compress-Archive -Path $packageDirectory -DestinationPath (Join-Path $projectRoot ('dist\' + $PackageName + '-0.1.0-win64.zip')) -Force
     }
 } finally { Pop-Location; $env:PATH = $previousPath }

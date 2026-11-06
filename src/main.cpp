@@ -12,6 +12,7 @@
 #include <QTextStream>
 #include <QTranslator>
 #include <QLibraryInfo>
+#include <QMessageBox>
 
 int runSelfTests(const QString &directory, bool native);
 
@@ -65,11 +66,10 @@ int main(int argc, char *argv[]) {
         qtTranslator.load("qt_zh_CN", QLibraryInfo::location(QLibraryInfo::TranslationsPath)))
         app.installTranslator(&qtTranslator);
     QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("EasySnip — Windows 截图、标注与贴图工具"));
+    parser.setApplicationDescription(QStringLiteral("EasySnip — Windows 截图与标注工具"));
     parser.addHelpOption();
     parser.addVersionOption();
-    for (const QString &option : {"tray", "capture", "screen", "fullscreen", "active", "last", "clipboard",
-                                  "toggle-pins", "recover", "settings", "quit", "native-smoke-test"})
+    for (const QString &option : {"tray", "capture", "screen", "fullscreen", "active", "last", "settings", "quit", "admin", "native-smoke-test"})
         parser.addOption(QCommandLineOption(option));
     parser.addOption(QCommandLineOption("open", "Open an image file", "path"));
     parser.addOption(QCommandLineOption("data-dir", "Override application data directory", "path"));
@@ -105,6 +105,17 @@ int main(int argc, char *argv[]) {
         socket.disconnectFromServer();
         return 0;
     }
+    if (!parser.isSet("quit") && !Native::isElevated() &&
+        (parser.isSet("admin") || settings.value("runtime/administrator", false).toBool())) {
+        QString error;
+        const bool launched = Native::restartElevated(app.arguments(), &error);
+        if (!error.isEmpty())
+            QMessageBox::critical(nullptr, QStringLiteral("EasySnip 管理员启动"), error);
+        qInfo() << "Administrator launch requested" << launched << error;
+        QMutexLocker locker(&logMutex);
+        flushLogLocked();
+        return launched || error.isEmpty() ? 0 : 1;
+    }
     QLocalServer server;
     server.setSocketOptions(QLocalServer::UserAccessOption);
     if (!server.listen(serverName)) {
@@ -112,6 +123,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     Application controller(settings);
+    qInfo() << "EasySnip started, pid" << QApplication::applicationPid()
+            << "elevated" << Native::isElevated() << "capture key" << settings.shortcut("capture");
     QObject::connect(&server, &QLocalServer::newConnection, &controller, [&] {
         while (server.hasPendingConnections()) {
             auto *client = server.nextPendingConnection();

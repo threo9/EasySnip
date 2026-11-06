@@ -6,16 +6,17 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QTimer>
+#include <QDebug>
 #include <windows.h>
+#include <shellapi.h>
 #include <dwmapi.h>
 #include <oleacc.h>
-#include <winhttp.h>
-#include <QElapsedTimer>
 
 namespace {
 GlobalInput *inputInstance = nullptr;
 HHOOK mouseHook = nullptr;
 bool superDragging = false;
+QString superModifiers = "Alt+Shift";
 POINT dragStart{};
 
 QString processPath(HWND window) {
@@ -33,9 +34,25 @@ QString processPath(HWND window) {
 
 QRect windowRect(HWND window) {
     RECT rect{};
-    if (FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect))))
+    if (GetAncestor(window, GA_ROOT) != window ||
+        FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect))))
         GetWindowRect(window, &rect);
     return QRect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+}
+
+QVector<QRect> childWindowElements(HWND window, const QRect &geometry) {
+    struct Children {
+        QRect geometry;
+        QVector<QRect> rectangles;
+    } children{geometry, {}};
+    EnumChildWindows(window, [](HWND child, LPARAM data) -> BOOL {
+        auto *children = reinterpret_cast<Children *>(data);
+        const QRect bounds = windowRect(child).intersected(children->geometry);
+        if (IsWindowVisible(child) && !bounds.isEmpty() && !children->rectangles.contains(bounds))
+            children->rectangles.append(bounds);
+        return children->rectangles.size() < 2048;
+    }, reinterpret_cast<LPARAM>(&children));
+    return children.rectangles;
 }
 
 struct WindowSearch {
@@ -62,8 +79,13 @@ BOOL CALLBACK findWindow(HWND window, LPARAM parameter) {
 LRESULT CALLBACK mouseProcedure(int code, WPARAM message, LPARAM data) {
     if (code == HC_ACTION && inputInstance) {
         const auto *event = reinterpret_cast<MSLLHOOKSTRUCT *>(data);
-        if (message == WM_LBUTTONDOWN && (GetAsyncKeyState(VK_MENU) & 0x8000) &&
-            (GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
+        const bool alt = GetAsyncKeyState(VK_MENU) & 0x8000;
+        const bool shift = GetAsyncKeyState(VK_SHIFT) & 0x8000;
+        const bool control = GetAsyncKeyState(VK_CONTROL) & 0x8000;
+        const bool win = (GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000;
+        const bool trigger = superModifiers == "Win" ? win :
+                             superModifiers == "Ctrl+Alt" ? control && alt : alt && shift;
+        if (message == WM_LBUTTONDOWN && trigger) {
             dragStart = event->pt;
             superDragging = true;
             return 1;
@@ -91,7 +113,7 @@ void Native::enableDpiAwareness() {
         setContext(reinterpret_cast<HANDLE>(-4));
 }
 
-Native::Desktop Native::captureDesktop() {
+Native::Desktop Native::captureDesktop(bool snapshotElements) {
     Desktop desktop;
     EnumDisplayMonitors(
         nullptr, nullptr,
@@ -184,6 +206,45 @@ Native::Desktop Native::captureDesktop() {
                 DeleteObject(icon.hbmColor);
         }
     }
+    if (snapshotElements) {
+        struct SnapshotContext {
+            QVector<WindowSnapshot> windows;
+            QHash<DWORD, QString> processes;
+        } context;
+        EnumWindows([](HWND window, LPARAM data) -> BOOL {
+            auto *context = reinterpret_cast<SnapshotContext *>(data);
+            DWORD pid = 0, cloaked = 0;
+            GetWindowThreadProcessId(window, &pid);
+            DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+            if (pid == GetCurrentProcessId() || !IsWindowVisible(window) || IsIconic(window) || cloaked)
+                return TRUE;
+            WindowSnapshot item;
+            item.handle = reinterpret_cast<quintptr>(window);
+            item.geometry = windowRect(window);
+            if (item.geometry.isEmpty())
+                return TRUE;
+            if (!context->processes.contains(pid))
+                context->processes.insert(pid, processPath(window));
+            item.executable = context->processes.value(pid);
+            item.nativeElements = childWindowElements(window, item.geometry);
+            item.elements = item.nativeElements;
+            wchar_t name[256]{};
+            GetClassNameW(window, name, 256);
+            const QString className = QString::fromWCharArray(name);
+            if (className.contains("Tray") || className.contains("Overflow") ||
+                className == "XamlExplorerHostIslandWindow" || className == "#32768") {
+                const auto accessible = automationElements(item.handle, nullptr, &item.cached);
+                for (const auto &bounds : accessible)
+                    if (!item.elements.contains(bounds))
+                        item.elements.append(bounds);
+                qInfo() << "Captured accessibility snapshot" << className << accessible.size()
+                        << "elements, complete" << item.cached;
+            }
+            context->windows.append(std::move(item));
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&context));
+        desktop.windows = std::move(context.windows);
+    }
     return desktop;
 }
 
@@ -213,63 +274,78 @@ bool Native::matchesProcess(const QString &path, const QStringList &patterns) {
     return false;
 }
 
-QRect Native::windowAt(const QPoint &point, const QStringList &excluded) {
+namespace {
+Native::WindowSnapshot detectionWindow(const QPoint &point, const QStringList &excluded,
+                                      const QVector<Native::WindowSnapshot> &windows) {
+    for (const auto &window : windows)
+        if (window.geometry.contains(point) && !Native::matchesProcess(window.executable, excluded))
+            return window;
+    if (!windows.isEmpty())
+        return {};
     WindowSearch search{point, excluded, nullptr};
     EnumWindows(findWindow, reinterpret_cast<LPARAM>(&search));
-    return search.found ? windowRect(search.found) : QRect();
+    Native::WindowSnapshot result;
+    if (search.found) {
+        result.handle = reinterpret_cast<quintptr>(search.found);
+        result.geometry = windowRect(search.found);
+        result.executable = processPath(search.found);
+    }
+    return result;
 }
-QVector<QRect> Native::windowElements(const QRect &region) {
-    struct Snapshot {
-        QRect region;
-        QVector<QRect> rectangles;
-    } snapshot{region, {}};
-    EnumWindows(
-        [](HWND window, LPARAM data) -> BOOL {
-            auto *snapshot = reinterpret_cast<Snapshot *>(data);
-            DWORD process = 0;
-            GetWindowThreadProcessId(window, &process);
-            if (process == GetCurrentProcessId() || !IsWindowVisible(window) || IsIconic(window))
-                return TRUE;
-            const QRect outer = windowRect(window);
-            if (!snapshot->region.intersects(outer))
-                return TRUE;
-            snapshot->rectangles.append(outer);
-            EnumChildWindows(
-                window,
-                [](HWND child, LPARAM data) -> BOOL {
-                    auto *snapshot = reinterpret_cast<Snapshot *>(data);
-                    const QRect rect = windowRect(child);
-                    if (IsWindowVisible(child) && !rect.isEmpty() && snapshot->region.intersects(rect) &&
-                        !snapshot->rectangles.contains(rect))
-                        snapshot->rectangles.append(rect);
-                    return snapshot->rectangles.size() < 2000;
-                },
-                data);
-            return snapshot->rectangles.size() < 2000;
-        },
-        reinterpret_cast<LPARAM>(&snapshot));
-    return snapshot.rectangles;
+QVector<QRect> elementHierarchy(const QPoint &point, const Native::WindowSnapshot &window,
+                               const QVector<QRect> &elements) {
+    QVector<QRect> candidates;
+    for (const auto &element : elements) {
+        const QRect bounds = element.intersected(window.geometry);
+        if (!bounds.isEmpty() && bounds.contains(point) && !candidates.contains(bounds))
+            candidates.append(bounds);
+    }
+    if (!window.geometry.isEmpty() && window.geometry.contains(point) && !candidates.contains(window.geometry))
+        candidates.append(window.geometry);
+    std::sort(candidates.begin(), candidates.end(), [](const QRect &a, const QRect &b) {
+        return qint64(a.width()) * a.height() < qint64(b.width()) * b.height();
+    });
+    QVector<QRect> hierarchy;
+    for (const auto &bounds : candidates)
+        if (hierarchy.isEmpty() || bounds.contains(hierarchy.last()))
+            hierarchy.append(bounds);
+    return hierarchy;
+}
+} // namespace
+
+QRect Native::windowAt(const QPoint &point, const QStringList &excluded, const QVector<WindowSnapshot> &windows) {
+    return detectionWindow(point, excluded, windows).geometry;
 }
 
+QVector<QRect> Native::cachedElementsAt(const QPoint &point, const QVector<WindowSnapshot> &windows,
+                                       const QStringList &excluded, const QStringList &nativePrograms) {
+    if (windows.isEmpty())
+        return {};
+    const auto window = detectionWindow(point, excluded, windows);
+    if (matchesProcess(window.executable, nativePrograms))
+        return elementHierarchy(point, window, window.nativeElements);
+    return window.cached ? elementHierarchy(point, window, window.elements) : QVector<QRect>();
+}
 QVector<QRect> Native::elementsAt(const QPoint &point, const QStringList &excluded,
-                                  const QStringList &nativePrograms) {
-    QVector<QRect> rectangles;
-    WindowSearch search{point, excluded, nullptr};
-    EnumWindows(findWindow, reinterpret_cast<LPARAM>(&search));
-    if (!search.found)
-        return rectangles;
-    if (matchesProcess(processPath(search.found), nativePrograms)) {
-        for (const auto &rect : windowElements(windowRect(search.found)))
-            if (rect.contains(point))
-                rectangles.append(rect);
-        std::sort(rectangles.begin(), rectangles.end(), [](const QRect &a, const QRect &b) {
-            return qint64(a.width()) * a.height() < qint64(b.width()) * b.height();
-        });
-        return rectangles;
+                                  const QStringList &nativePrograms, const QVector<WindowSnapshot> &windows) {
+    const auto target = detectionWindow(point, excluded, windows);
+    QVector<QRect> rectangles = target.elements;
+    const HWND window = reinterpret_cast<HWND>(target.handle);
+    if (!window)
+        return {};
+    const bool unchanged = IsWindow(window) && IsWindowVisible(window) && windowRect(window) == target.geometry;
+    if (matchesProcess(target.executable, nativePrograms)) {
+        rectangles = target.nativeElements;
+        if (unchanged)
+            rectangles += childWindowElements(window, target.geometry);
+        return elementHierarchy(point, target, rectangles);
     }
-    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (target.cached || !unchanged)
+        return elementHierarchy(point, target, rectangles);
+    rectangles += automationElements(target.handle, &point);
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IAccessible *accessible = nullptr;
-    if (SUCCEEDED(AccessibleObjectFromWindow(search.found, OBJID_CLIENT, IID_IAccessible,
+    if (SUCCEEDED(AccessibleObjectFromWindow(window, OBJID_CLIENT, IID_IAccessible,
                                              reinterpret_cast<void **>(&accessible)))) {
         for (int depth = 0; depth < 24 && accessible; ++depth) {
             VARIANT child;
@@ -311,12 +387,9 @@ QVector<QRect> Native::elementsAt(const QPoint &point, const QStringList &exclud
         if (accessible)
             accessible->Release();
     }
-    const QRect outer = windowRect(search.found);
-    if (!rectangles.contains(outer))
-        rectangles.append(outer);
     if (SUCCEEDED(com))
         CoUninitialize();
-    return rectangles;
+    return elementHierarchy(point, target, rectangles);
 }
 
 bool Native::setAutostart(bool enabled) {
@@ -336,66 +409,61 @@ void Native::setPriority(const QString &priority) {
                                                                : NORMAL_PRIORITY_CLASS);
 }
 
-QPair<QByteArray, QString> Native::downloadImage(const QUrl &url, qint64 maximumBytes) {
-    struct InternetHandle {
-        HINTERNET value = nullptr;
-        ~InternetHandle() {
-            if (value)
-                WinHttpCloseHandle(value);
+bool Native::isElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    const bool ok = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size);
+    CloseHandle(token);
+    return ok && elevation.TokenIsElevated;
+}
+
+QString Native::quoteArguments(const QStringList &arguments) {
+    QStringList quoted;
+    for (const QString &argument : arguments) {
+        QString result = "\"";
+        int slashes = 0;
+        for (const QChar character : argument) {
+            if (character == '\\') {
+                ++slashes;
+                continue;
+            }
+            result += QString(character == '"' ? slashes * 2 + 1 : slashes, '\\');
+            result += character;
+            slashes = 0;
         }
-    };
-    // Windows 8.1+ constant, absent from the bundled MinGW 7.3 headers.
-    constexpr DWORD accessAutomaticProxy = 4;
-    InternetHandle session{WinHttpOpen(L"EasySnip/0.1", accessAutomaticProxy, WINHTTP_NO_PROXY_NAME,
-                                       WINHTTP_NO_PROXY_BYPASS, 0)};
-    if (!session.value)
-        return {{}, QStringLiteral("无法初始化 Windows 网络服务。")};
-    WinHttpSetTimeouts(session.value, 10000, 10000, 15000, 15000);
-    const std::wstring host = QString::fromLatin1(QUrl::toAce(url.host())).toStdWString();
-    const bool secure = url.scheme() == "https";
-    InternetHandle connection{
-        WinHttpConnect(session.value, host.c_str(), INTERNET_PORT(url.port(secure ? 443 : 80)), 0)};
-    if (!connection.value)
-        return {{}, QStringLiteral("无法连接图片服务器。")};
-    QString resource = url.path(QUrl::FullyEncoded);
-    if (resource.isEmpty())
-        resource = "/";
-    if (url.hasQuery())
-        resource += '?' + url.query(QUrl::FullyEncoded);
-    const std::wstring requestPath = resource.toStdWString();
-    InternetHandle request{WinHttpOpenRequest(connection.value, L"GET", requestPath.c_str(), nullptr,
-                                              WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                              secure ? WINHTTP_FLAG_SECURE : 0)};
-    if (!request.value)
-        return {{}, QStringLiteral("无法创建图片请求。")};
-    DWORD redirects = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
-    WinHttpSetOption(request.value, WINHTTP_OPTION_REDIRECT_POLICY, &redirects, sizeof(redirects));
-    if (!WinHttpSendRequest(request.value, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0,
-                            0) ||
-        !WinHttpReceiveResponse(request.value, nullptr))
-        return {{}, QStringLiteral("图片下载失败，Windows 错误 %1").arg(GetLastError())};
-    DWORD status = 0, statusSize = sizeof(status);
-    if (!WinHttpQueryHeaders(request.value, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX) ||
-        status < 200 || status >= 300)
-        return {{}, QStringLiteral("图片服务器返回 HTTP %1").arg(status)};
-    QByteArray data;
-    QElapsedTimer elapsed;
-    elapsed.start();
-    char block[32768];
-    for (;;) {
-        DWORD received = 0;
-        if (!WinHttpReadData(request.value, block, sizeof(block), &received))
-            return {{}, QStringLiteral("读取图片失败，Windows 错误 %1").arg(GetLastError())};
-        if (received == 0)
-            break;
-        if (data.size() + qint64(received) > maximumBytes)
-            return {{}, QStringLiteral("网页图片超过配置的下载大小上限。")};
-        data.append(block, int(received));
-        if (elapsed.elapsed() > 30000)
-            return {{}, QStringLiteral("图片下载超时。")};
+        result += QString(slashes * 2, '\\') + '"';
+        quoted.append(result);
     }
-    return {data, {}};
+    return quoted.join(' ');
+}
+
+bool Native::restartElevated(const QStringList &arguments, QString *error) {
+    if (error)
+        error->clear();
+    const std::wstring executable = QDir::toNativeSeparators(QApplication::applicationFilePath()).toStdWString();
+    const std::wstring parameters = quoteArguments(arguments.mid(1)).toStdWString();
+    const std::wstring directory = QDir::currentPath().toStdWString();
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    info.lpVerb = L"runas";
+    info.lpFile = executable.c_str();
+    info.lpParameters = parameters.c_str();
+    info.lpDirectory = directory.c_str();
+    info.nShow = SW_HIDE;
+    const bool ok = ShellExecuteExW(&info);
+    const DWORD code = ok ? ERROR_SUCCESS : GetLastError();
+    if (info.hProcess)
+        CloseHandle(info.hProcess);
+    if (SUCCEEDED(com))
+        CoUninitialize();
+    if (!ok && code != ERROR_CANCELLED && error)
+        *error = QStringLiteral("管理员启动失败，Windows 错误 %1").arg(code);
+    return ok;
 }
 
 GlobalInput::GlobalInput(QObject *parent) : QObject(parent) {
@@ -409,17 +477,29 @@ GlobalInput::~GlobalInput() {
     inputInstance = nullptr;
 }
 void GlobalInput::clear() {
-    for (int id : registered_)
+    for (int id : registered_.keys())
         UnregisterHotKey(nullptr, id);
     registered_.clear();
 }
-bool GlobalInput::registerShortcut(int id, const QKeySequence &sequence, QString *error) {
-    if (sequence.isEmpty())
-        return true;
-    if (sequence.count() != 1) {
-        *error = QStringLiteral("全局快捷键仅支持单组按键");
+bool GlobalInput::registerShortcut(int id, const QKeySequence &sequence, QString *error, bool *alreadyInUse) {
+    if (error)
+        error->clear();
+    if (alreadyInUse)
+        *alreadyInUse = false;
+    auto fail = [error](const QString &message) {
+        if (error)
+            *error = message;
         return false;
+    };
+    if (id < 1 || id > 0xbfff)
+        return fail(QStringLiteral("全局快捷键标识超出 Windows 支持范围"));
+    if (sequence.isEmpty()) {
+        if (registered_.remove(id))
+            UnregisterHotKey(nullptr, id);
+        return true;
     }
+    if (sequence.count() != 1)
+        return fail(QStringLiteral("全局快捷键仅支持单组按键"));
     const int combined = sequence[0];
     const int key = combined & ~Qt::KeyboardModifierMask;
     UINT modifiers = MOD_NOREPEAT;
@@ -458,15 +538,34 @@ bool GlobalInput::registerShortcut(int id, const QKeySequence &sequence, QString
             }
         }
     }
-    if (!vk || key == Qt::Key_F12 || !RegisterHotKey(nullptr, id, modifiers, vk)) {
-        *error =
-            QStringLiteral("快捷键 %1 注册失败，可能被其他程序占用或键位不受支持").arg(sequence.toString());
-        return false;
+    if (!vk || key == Qt::Key_F12)
+        return fail(QStringLiteral("快捷键 %1 的键位不受支持，F12 为系统调试保留键").arg(sequence.toString()));
+    const bool replacing = registered_.contains(id);
+    const Shortcut previous = registered_.value(id);
+    if (replacing && previous.modifiers == modifiers && previous.key == vk)
+        return true;
+    if (replacing)
+        UnregisterHotKey(nullptr, id);
+    if (!RegisterHotKey(nullptr, id, modifiers, vk)) {
+        const DWORD code = GetLastError();
+        if (alreadyInUse)
+            *alreadyInUse = code == ERROR_HOTKEY_ALREADY_REGISTERED;
+        if (replacing && !RegisterHotKey(nullptr, id, previous.modifiers, previous.key)) {
+            registered_.remove(id);
+            qWarning() << "Could not restore previous shortcut" << id << GetLastError();
+        }
+        const QString reason = code == ERROR_HOTKEY_ALREADY_REGISTERED
+            ? QStringLiteral("按键已被其他热键占用") : QStringLiteral("系统拒绝注册");
+        return fail(QStringLiteral("快捷键 %1 注册失败，%2，Windows 错误 %3")
+                    .arg(sequence.toString(), reason).arg(code));
     }
-    registered_.append(id);
+    registered_.insert(id, {modifiers, vk});
+    qInfo().noquote() << "Global shortcut registered" << sequence.toString() << "id" << id
+                     << "elevated" << Native::isElevated();
     return true;
 }
-void GlobalInput::enableSuperDrag(bool enabled) {
+void GlobalInput::enableSuperDrag(bool enabled, const QString &modifiers) {
+    superModifiers = modifiers;
     if (enabled && !mouseHook)
         mouseHook = SetWindowsHookExW(WH_MOUSE_LL, mouseProcedure, GetModuleHandleW(nullptr), 0);
     if (!enabled && mouseHook) {
@@ -477,9 +576,14 @@ void GlobalInput::enableSuperDrag(bool enabled) {
 }
 bool GlobalInput::nativeEventFilter(const QByteArray &, void *message, long *result) {
     auto *msg = static_cast<MSG *>(message);
-    if (msg->message != WM_HOTKEY)
+    if (msg->message != WM_HOTKEY || !registered_.contains(int(msg->wParam)))
         return false;
+    const Shortcut shortcut = registered_.value(int(msg->wParam));
+    if (HIWORD(msg->lParam) != shortcut.key || LOWORD(msg->lParam) != (shortcut.modifiers & ~MOD_NOREPEAT))
+        return false;
+    qInfo() << "Global shortcut activated" << int(msg->wParam);
     emit activated(int(msg->wParam));
-    *result = 0;
+    if (result)
+        *result = 0;
     return true;
 }

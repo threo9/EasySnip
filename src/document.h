@@ -24,6 +24,8 @@ enum class Tool {
 };
 QString toolName(Tool tool);
 QString toolKey(Tool tool);
+bool isLineTool(Tool tool);
+bool isEffectTool(Tool tool);
 
 struct Annotation {
     Tool tool = Tool::Rectangle;
@@ -51,6 +53,7 @@ struct Document {
     QVector<Annotation> annotations;
     QVector<QRect> detectedElements;
     int cornerRadius = 0;
+    QRect sourceRect;
     QImage render(bool frame = false) const;
     QJsonObject toJson() const;
     static Document fromJson(const QJsonObject &object, const QImage &image);

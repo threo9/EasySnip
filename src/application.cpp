@@ -5,6 +5,9 @@
 
 namespace {
 QIcon applicationIcon() {
+    const QIcon cached = qvariant_cast<QIcon>(qApp->property("EasySnipApplicationIcon"));
+    if (!cached.isNull())
+        return cached;
     QPixmap pixmap(64, 64);
     pixmap.fill(Qt::transparent);
     QPainter painter(&pixmap);
@@ -17,7 +20,10 @@ QIcon applicationIcon() {
     painter.drawPolyline(QPolygonF(QVector<QPointF>{QPointF(50, 38), QPointF(50, 50), QPointF(35, 50)}));
     painter.setPen(QPen(Qt::white, 5, Qt::SolidLine, Qt::RoundCap));
     painter.drawLine(24, 40, 41, 23);
-    return QIcon(pixmap);
+    painter.end();
+    const QIcon icon(pixmap);
+    qApp->setProperty("EasySnipApplicationIcon", icon);
+    return icon;
 }
 } // namespace
 
@@ -437,19 +443,15 @@ bool Application::saveImage(const QImage &source, const QString &path) {
         painter.drawImage(0, 0, image);
         painter.end();
         image = flat;
-    } else if (settings_.value("output/removeOpaqueAlpha", true).toBool() && image.hasAlphaChannel()) {
-        bool opaque = true;
-        for (int y = 0; y < image.height() && opaque; ++y)
-            for (int x = 0; x < image.width(); ++x)
-                if (qAlpha(image.pixel(x, y)) != 255) {
-                    opaque = false;
-                    break;
-                }
-        if (opaque)
-            image = image.convertToFormat(QImage::Format_RGB32);
-    }
-    if (settings_.value("output/metadata", true).toBool())
-        image.setText("Software", "EasySnip 0.1.0 / Qt 5.14.2");
+    } else if (settings_.value("output/removeOpaqueAlpha", true).toBool() && image.hasAlphaChannel() &&
+               hasOnlyOpaquePixels(image))
+        image = image.convertToFormat(QImage::Format_RGB32);
+    const bool metadata = settings_.value("output/metadata", true).toBool();
+    const QString software = "EasySnip 0.1.0 / Qt 5.14.2";
+    const bool writerMetadata = metadata && !image.textKeys().contains("Software");
+    // Preserve replacement semantics for existing metadata; avoid detaching unchanged pixels otherwise.
+    if (metadata && !writerMetadata && image.text("Software") != software)
+        image.setText("Software", software);
     QSaveFile file(path);
     if (!file.open(QIODevice::WriteOnly)) {
         notify(file.errorString(), true);
@@ -457,6 +459,12 @@ bool Application::saveImage(const QImage &source, const QString &path) {
     }
     QImageWriter writer(&file, format.isEmpty() ? "png" : format);
     writer.setQuality(95);
+    if (writerMetadata) {
+        if (writer.supportsOption(QImageIOHandler::Description))
+            writer.setText("Software", software);
+        else
+            image.setText("Software", software);
+    }
     if (!writer.write(image) || !file.commit()) {
         notify(QStringLiteral("保存失败 %1\n%2").arg(path, writer.errorString()), true);
         return false;
@@ -482,7 +490,8 @@ bool Application::output(const Document &document, const QString &action, QWidge
         return false;
     if (!recordId.isEmpty() && library_.record(recordId).id.isEmpty())
         recordId.clear();
-    const QImage image = document.render(settings_.value("output/frame", false).toBool());
+    const bool frame = settings_.value("output/frame", false).toBool();
+    const QImage image = document.render(frame);
     QStringList targets;
     if (action == "finish") {
         if (settings_.value("output/copy", true).toBool())
@@ -590,8 +599,8 @@ bool Application::output(const Document &document, const QString &action, QWidge
     if (!successful)
         return false;
     if (recordId.isEmpty())
-        recordId = library_.add(document);
-    else if (!library_.updateDocument(recordId, document))
+        recordId = library_.add(document, frame ? QImage() : image);
+    else if (!library_.updateDocument(recordId, document, frame ? QImage() : image))
         return false;
     if (recordId.isEmpty())
         return false;

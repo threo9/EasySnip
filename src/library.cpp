@@ -155,7 +155,7 @@ bool Library::writeRecord(const Record &record) {
     }
     return true;
 }
-bool Library::saveDocument(Record record, const Document &document) {
+bool Library::saveDocument(Record record, const Document &document, const QImage &unframedRender) {
     if (document.image.isNull())
         return false;
     const Record old = this->record(record.id);
@@ -165,10 +165,13 @@ bool Library::saveDocument(Record record, const Document &document) {
     record.imageSize = document.image.size();
     record.document = document.toJson();
     const bool sourceSaved = atomicWrite(path(record.sourceFile), imageBytes(document.image));
+    QImage rendered = unframedRender;
+    if (sourceSaved && (rendered.isNull() || rendered.size() != document.image.size()))
+        rendered = document.render();
     const bool previewSaved =
         sourceSaved && atomicWrite(path(record.previewFile),
-                                   imageBytes(document.render().scaled(320, 220, Qt::KeepAspectRatio,
-                                                                       Qt::SmoothTransformation)));
+                                   imageBytes(rendered.scaled(320, 220, Qt::KeepAspectRatio,
+                                                             Qt::SmoothTransformation)));
     if (!previewSaved || !writeRecord(record)) {
         QFile::remove(path(record.sourceFile));
         QFile::remove(path(record.previewFile));
@@ -192,18 +195,18 @@ bool Library::saveDocument(Record record, const Document &document) {
     emit changed();
     return true;
 }
-QString Library::add(const Document &document) {
+QString Library::add(const Document &document, const QImage &unframedRender) {
     Record record;
     record.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     record.created = QDateTime::currentDateTime();
     record.title = record.created.toString("yyyy-MM-dd HH:mm:ss");
-    if (!saveDocument(record, document))
+    if (!saveDocument(record, document, unframedRender))
         return {};
     return record.id;
 }
-bool Library::updateDocument(const QString &id, const Document &document) {
+bool Library::updateDocument(const QString &id, const Document &document, const QImage &unframedRender) {
     const Record item = record(id);
-    return !item.id.isEmpty() && saveDocument(item, document);
+    return !item.id.isEmpty() && saveDocument(item, document, unframedRender);
 }
 bool Library::updateRecord(const Record &record) {
     if (!safeId(record.id) || this->record(record.id).id.isEmpty() || !writeRecord(record))
@@ -217,6 +220,9 @@ bool Library::updateRecord(const Record &record) {
     return false;
 }
 bool Library::remove(const QString &id) {
+    return removeRecord(id, true);
+}
+bool Library::removeRecord(const QString &id, bool notify) {
     for (int i = 0; i < records_.size(); ++i)
         if (records_[i].id == id) {
             const auto item = records_[i];
@@ -227,21 +233,30 @@ bool Library::remove(const QString &id) {
             QFile::remove(path(item.sourceFile));
             QFile::remove(path(item.previewFile));
             records_.removeAt(i);
-            emit changed();
+            if (notify)
+                emit changed();
             return true;
         }
     return false;
 }
 void Library::clearHistory() {
     const auto snapshot = records_;
+    bool removed = false;
     for (const auto &item : snapshot)
-        remove(item.id);
+        removed = removeRecord(item.id, false) || removed;
+    if (removed)
+        emit changed();
 }
 void Library::prune() {
     const int limit = qBound(0, settings_.value("history/limit", 100).toInt(), 10000);
+    if (records_.size() <= limit)
+        return;
     const auto snapshot = records_;
+    bool removed = false;
     for (int i = limit; i < snapshot.size(); ++i)
-        remove(snapshot[i].id);
+        removed = removeRecord(snapshot[i].id, false) || removed;
+    if (removed)
+        emit changed();
 }
 bool Library::exportBackup(const QString &fileName) {
     QSaveFile file(fileName);
@@ -451,23 +466,34 @@ LibraryWindow::LibraryWindow(Library &library, Settings &settings) : library_(li
     auto *help = new QLabel(QStringLiteral("双击编辑 · 右键复制、保存或管理截图"));
     help->setObjectName("muted");
     body->addWidget(help);
-    connect(search_, &QLineEdit::textChanged, this, &LibraryWindow::refresh);
+    connect(search_, &QLineEdit::textChanged, this, &LibraryWindow::requestRefresh);
     connect(gallery_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
         emit recordAction(item->data(Qt::UserRole).toString(), "edit");
     });
     connect(gallery_, &QListWidget::customContextMenuRequested, this, &LibraryWindow::itemMenu);
-    connect(&library_, &Library::changed, this, &LibraryWindow::refresh);
-    refresh();
+    connect(&library_, &Library::changed, this, &LibraryWindow::requestRefresh);
+    requestRefresh();
+}
+void LibraryWindow::requestRefresh() {
+    refreshPending_ = true;
+    if (isVisible())
+        refresh();
+}
+void LibraryWindow::showEvent(QShowEvent *event) {
+    QMainWindow::showEvent(event);
+    if (refreshPending_)
+        refresh();
 }
 void LibraryWindow::refresh() {
+    refreshPending_ = false;
     const QString selectedId =
         gallery_->currentItem() ? gallery_->currentItem()->data(Qt::UserRole).toString() : QString();
     gallery_->clear();
     const QString query = search_->text().trimmed();
     int count = 0;
     for (const auto &record : library_.records()) {
-        const QString searchable = record.title + " " + record.created.toString("yyyy-MM-dd HH:mm:ss");
-        if (!query.isEmpty() && !searchable.contains(query, Qt::CaseInsensitive))
+        if (!query.isEmpty() &&
+            !(record.title + " " + record.created.toString("yyyy-MM-dd HH:mm:ss")).contains(query, Qt::CaseInsensitive))
             continue;
         auto *item = new QListWidgetItem(QIcon(library_.previewPath(record)),
                                          record.title + QString("\n%1 × %2")

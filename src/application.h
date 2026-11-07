@@ -19,6 +19,7 @@ class Application : public QObject {
     void processArguments(const QStringList &arguments);
 
   private:
+    friend int runSelfTests(const QString &directory, bool native);
     void configureInput();
     void capture(const QString &mode = "region", const QRect &preset = {}, int delay = -1);
     void showCapture(Native::Desktop desktop, const QRect &initial);

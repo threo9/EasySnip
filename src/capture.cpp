@@ -608,20 +608,38 @@ QRect CaptureOverlay::selectedGlobal() const {
     return selection_.translated(desktop_.geometry.topLeft());
 }
 QImage CaptureOverlay::backgroundImage() const {
-    QImage image = desktop_.image;
-    if (cursor_ && !desktop_.cursorImage.isNull()) {
-        QPainter painter(&image);
-        painter.drawImage(desktop_.cursorPosition - desktop_.geometry.topLeft() - desktop_.cursorHotspot,
-                          desktop_.cursorImage);
+    if (!cursor_ || desktop_.cursorImage.isNull()) {
+        backgroundCache_ = {};
+        return desktop_.image;
     }
-    return image;
+    const QPoint position = desktop_.cursorPosition - desktop_.geometry.topLeft() - desktop_.cursorHotspot;
+    if (backgroundCache_.desktopKey != desktop_.image.cacheKey() ||
+        backgroundCache_.cursorKey != desktop_.cursorImage.cacheKey() ||
+        backgroundCache_.cursorPosition != position || backgroundCache_.image.isNull()) {
+        backgroundCache_.image = desktop_.image;
+        QPainter painter(&backgroundCache_.image);
+        painter.drawImage(position, desktop_.cursorImage);
+        painter.end();
+        backgroundCache_.desktopKey = desktop_.image.cacheKey();
+        backgroundCache_.cursorKey = desktop_.cursorImage.cacheKey();
+        backgroundCache_.cursorPosition = position;
+    }
+    return backgroundCache_.image;
 }
 Document CaptureOverlay::selectionBackground() const {
     if (historyIndex_ >= 0 && canvas_)
         return canvas_->document();
     Document document;
-    if (!selection_.isEmpty())
-        document.image = backgroundImage().copy(selection_.intersected(desktop_.image.rect()));
+    if (!selection_.isEmpty()) {
+        const QImage background = backgroundImage();
+        const QRect region = selection_.intersected(desktop_.image.rect());
+        if (selectionBackgroundKey_ != background.cacheKey() || selectionImageRect_ != region) {
+            selectionImage_ = background.copy(region);
+            selectionBackgroundKey_ = background.cacheKey();
+            selectionImageRect_ = region;
+        }
+        document.image = selectionImage_;
+    }
     document.cornerRadius = radius_;
     document.sourceRect = selectedGlobal();
     if (elements_)
@@ -1563,7 +1581,6 @@ void CaptureOverlay::updateDetectionAt(const QPoint &point) {
     } else
         setHover(
             Native::windowAt(point, excluded, desktop_.windows).translated(-desktop_.geometry.topLeft()).intersected(rect()));
-    update();
 }
 void CaptureOverlay::invalidateDetection() {
     ++detectionGeneration_;
@@ -1571,19 +1588,23 @@ void CaptureOverlay::invalidateDetection() {
     elementIndex_ = 0;
 }
 void CaptureOverlay::applyDetection(const QVector<QRect> &rectangles) {
+    bool changed = elementRects_ != rectangles;
     if (elementRects_ != rectangles) {
         elementRects_ = rectangles;
         elementIndex_ = 0;
     }
     for (const auto &element : elementRects_)
-        if (!detectedElements_.contains(element))
+        if (!detectedElements_.contains(element)) {
             detectedElements_.append(element);
+            changed = true;
+        }
     if (selection_.isEmpty())
         setHover(elementRects_.isEmpty() ? QRect() :
                  elementRects_[elementIndex_].translated(-desktop_.geometry.topLeft()).intersected(rect()));
     if (canvas_)
         canvas_->setDetectedElements(selectionBackground().detectedElements);
-    update();
+    if (changed)
+        update();
 }
 void CaptureOverlay::setHover(const QRect &rectangle) {
     if (rectangle == hover_)

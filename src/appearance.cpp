@@ -21,6 +21,8 @@ class LightWindowFrames final : public QObject {
     explicit LightWindowFrames(QObject *parent) : QObject(parent) {}
     bool eventFilter(QObject *object, QEvent *event) override {
 #ifdef Q_OS_WIN
+        if (event->type() != QEvent::Show && event->type() != QEvent::WinIdChange)
+            return false;
         auto *widget = qobject_cast<QWidget *>(object);
         if (widget && widget->isWindow() && !(widget->windowFlags() & Qt::FramelessWindowHint) &&
             (event->type() == QEvent::Show || event->type() == QEvent::WinIdChange) &&
@@ -42,14 +44,39 @@ class LightWindowFrames final : public QObject {
     }
 };
 
-QIcon paintedIcon(const std::function<void(QPainter &, const QColor &)> &draw) {
+class IconCache final : public QObject {
+  public:
+    using QObject::QObject;
+    QHash<QString, QIcon> icons;
+    QRgb accent = 0;
+    int pixels = 0;
+    QString font;
+};
+
+QIcon paintedIcon(const QString &key, const std::function<void(QPainter &, const QColor &)> &draw) {
+    // Icons are created on the GUI thread and released with the application.
+    static QPointer<IconCache> cache;
+    if (!cache)
+        cache = new IconCache(qApp);
+    const QRgb accent = Ui::accent().rgba();
+    const int pixels = uiPixels(24) * 2;
+    const QString font = qApp->font().key();
+    if (cache->accent != accent || cache->pixels != pixels || cache->font != font) {
+        cache->icons.clear();
+        cache->accent = accent;
+        cache->pixels = pixels;
+        cache->font = font;
+    }
+    const auto existing = cache->icons.constFind(key);
+    if (existing != cache->icons.cend())
+        return existing.value();
     QIcon icon;
     for (auto mode : {QIcon::Normal, QIcon::Disabled, QIcon::Active, QIcon::Selected}) {
         for (auto state : {QIcon::Off, QIcon::On}) {
             const QColor color = mode == QIcon::Disabled ? QColor("#a0a0a0")
                                 : state == QIcon::On || mode == QIcon::Selected ? Ui::accent()
                                                                               : QColor("#303030");
-            QPixmap pixmap(uiPixels(24) * 2, uiPixels(24) * 2);
+            QPixmap pixmap(pixels, pixels);
             pixmap.fill(Qt::transparent);
             QPainter painter(&pixmap);
             painter.setRenderHint(QPainter::Antialiasing);
@@ -61,6 +88,7 @@ QIcon paintedIcon(const std::function<void(QPainter &, const QColor &)> &draw) {
             icon.addPixmap(pixmap, mode, state);
         }
     }
+    cache->icons.insert(key, icon);
     return icon;
 }
 } // namespace
@@ -83,7 +111,7 @@ QString Ui::scaledStyle(const QString &style) {
 }
 
 QIcon Ui::toolIcon(Tool tool) {
-    return paintedIcon([tool](QPainter &painter, const QColor &color) {
+    return paintedIcon("tool/" + toolKey(tool), [tool](QPainter &painter, const QColor &color) {
         switch (tool) {
         case Tool::Select:
             painter.drawPolygon(QPolygonF({{5, 3}, {6, 20}, {10, 15}, {14, 21}, {17, 19}, {13, 13}, {20, 12}}));
@@ -143,7 +171,7 @@ QIcon Ui::toolIcon(Tool tool) {
 }
 
 QIcon Ui::lineStyleIcon(bool dashed) {
-    return paintedIcon([dashed](QPainter &painter, const QColor &color) {
+    return paintedIcon("line/" + QString::number(dashed), [dashed](QPainter &painter, const QColor &color) {
         painter.setPen(QPen(color, 2, Qt::SolidLine, Qt::FlatCap));
         if (dashed) {
             painter.drawLine(QPointF(3, 12), QPointF(10, 12));
@@ -155,7 +183,7 @@ QIcon Ui::lineStyleIcon(bool dashed) {
 }
 
 QIcon Ui::fillModeIcon(bool filled) {
-    return paintedIcon([filled](QPainter &painter, const QColor &color) {
+    return paintedIcon("fill/" + QString::number(filled), [filled](QPainter &painter, const QColor &color) {
         const QRectF bounds(3, 5, 18, 14);
         if (filled) {
             painter.save();
@@ -174,7 +202,7 @@ QIcon Ui::fillModeIcon(bool filled) {
 }
 
 QIcon Ui::commandIcon(const QString &command) {
-    return paintedIcon([command](QPainter &painter, const QColor &color) {
+    return paintedIcon("command/" + command, [command](QPainter &painter, const QColor &color) {
         if (command == "copy") {
             painter.drawRoundedRect(QRectF(7, 7, 14, 14), 2, 2);
             painter.drawPolyline(QPolygonF({{16, 3}, {3, 3}, {3, 16}}));
@@ -282,11 +310,19 @@ void Ui::applyLightAppearance(const Settings &settings) {
     for (auto role : {QPalette::Text, QPalette::WindowText, QPalette::ButtonText, QPalette::PlaceholderText})
         palette.setColor(QPalette::Disabled, role, QColor("#9b9b9b"));
     palette.setColor(QPalette::Disabled, QPalette::Highlight, QColor("#dedede"));
-    qApp->setPalette(palette);
+    if (qApp->palette() != palette)
+        qApp->setPalette(palette);
     QFont font(settings.value("appearance/font", "Microsoft YaHei UI").toString());
     font.setPixelSize(uiPixels(13));
-    qApp->setFont(font);
-    qApp->setDoubleClickInterval(qBound(100, settings.value("input/doubleClickMs", 400).toInt(), 1000));
+    if (qApp->font() != font)
+        qApp->setFont(font);
+    const int doubleClickMs = qBound(100, settings.value("input/doubleClickMs", 400).toInt(), 1000);
+    if (qApp->doubleClickInterval() != doubleClickMs)
+        qApp->setDoubleClickInterval(doubleClickMs);
+    const QVariantList styleKey{accent.rgba(), qApp->property("EasySnipUiScale")};
+    if (qApp->property("EasySnipStyleKey").toList() == styleKey &&
+        qApp->property("EasySnipStyleSheet").toString() == qApp->styleSheet())
+        return;
     const QString style = QStringLiteral(
         "QWidget { color:#1a1a1a; font-size:13px; }"
         "QMainWindow,QDialog { background:#f3f3f3; }"
@@ -389,5 +425,9 @@ void Ui::applyLightAppearance(const Settings &settings) {
     ).arg(accent.name(), blend(accent, 0.09).name(), blend(accent, 0.3).name(), foreground,
           accent.lighter(108).name(), accent.lighter(118).name(),
           foreground == "#ffffff" ? "check.svg" : "check-dark.svg");
-    qApp->setStyleSheet(scaledStyle(style));
+    const QString scaled = scaledStyle(style);
+    if (qApp->styleSheet() != scaled)
+        qApp->setStyleSheet(scaled);
+    qApp->setProperty("EasySnipStyleKey", styleKey);
+    qApp->setProperty("EasySnipStyleSheet", scaled);
 }

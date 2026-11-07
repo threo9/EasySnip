@@ -45,6 +45,7 @@ struct Annotation {
     QString text;
     QRectF bounds() const;
     QPainterPath effectPath() const;
+    bool sameContent(const Annotation &other) const;
     QJsonObject toJson() const;
     static Annotation fromJson(const QJsonObject &object);
 };
@@ -61,5 +62,6 @@ struct Document {
 };
 
 QImage gaussianBlur(const QImage &image, int radius);
+bool hasOnlyOpaquePixels(const QImage &image);
 QString colorText(const QColor &color, const QString &format, bool uppercase);
 QString decodeCodes(const QImage &image);

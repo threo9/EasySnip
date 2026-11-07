@@ -73,6 +73,16 @@ class CaptureOverlay : public QWidget {
     bool backgroundDragEvent(QMouseEvent *event);
     int handleAt(const QPoint &point) const;
     Native::Desktop desktop_;
+    struct BackgroundCache {
+        qint64 desktopKey = 0;
+        qint64 cursorKey = 0;
+        QPoint cursorPosition;
+        QImage image;
+    };
+    mutable BackgroundCache backgroundCache_;
+    mutable QImage selectionImage_;
+    mutable qint64 selectionBackgroundKey_ = 0;
+    mutable QRect selectionImageRect_;
     Settings &settings_;
     QRect selection_;
     QRect resizeStart_;

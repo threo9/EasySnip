@@ -61,6 +61,25 @@ QJsonObject Annotation::toJson() const {
             {"number", number},
             {"text", text}};
 }
+bool Annotation::sameContent(const Annotation &other) const {
+    // Match toJson() equality, including exact coordinates and serialized RGBA colors.
+    const auto sameNumber = [](double a, double b) {
+        return a == b || (!qIsFinite(a) && !qIsFinite(b) && QJsonValue(a) == QJsonValue(b));
+    };
+    if (tool != other.tool || !sameNumber(rect.x(), other.rect.x()) ||
+        !sameNumber(rect.y(), other.rect.y()) || !sameNumber(rect.width(), other.rect.width()) ||
+        !sameNumber(rect.height(), other.rect.height()) || points.size() != other.points.size() ||
+        color.rgba() != other.color.rgba() || fill.rgba() != other.fill.rgba() ||
+        outline.rgba() != other.outline.rgba() || !sameNumber(width, other.width) ||
+        !sameNumber(rotation, other.rotation) || !sameNumber(fontSize, other.fontSize) ||
+        !sameNumber(outlineWidth, other.outlineWidth) || lineStyle != other.lineStyle ||
+        shape != other.shape || arrowStyle != other.arrowStyle || number != other.number || text != other.text)
+        return false;
+    for (int i = 0; i < points.size(); ++i)
+        if (!sameNumber(points[i].x(), other.points[i].x()) || !sameNumber(points[i].y(), other.points[i].y()))
+            return false;
+    return true;
+}
 Annotation Annotation::fromJson(const QJsonObject &object) {
     Annotation item;
     const int storedTool = qBound(0, object["tool"].toInt(1), int(Tool::Magnify));
@@ -150,6 +169,49 @@ QImage gaussianBlur(const QImage &source, int radius) {
     return output;
 }
 
+bool hasOnlyOpaquePixels(const QImage &image) {
+    if (!image.hasAlphaChannel())
+        return true;
+    for (int y = 0; y < image.height(); ++y) {
+        const uchar *row = image.constScanLine(y);
+        switch (image.format()) {
+        case QImage::Format_ARGB32:
+        case QImage::Format_ARGB32_Premultiplied: {
+            const auto *pixels = reinterpret_cast<const QRgb *>(row);
+            for (int x = 0; x < image.width(); ++x)
+                if (qAlpha(pixels[x]) != 255)
+                    return false;
+            break;
+        }
+        case QImage::Format_RGBA8888:
+        case QImage::Format_RGBA8888_Premultiplied:
+            for (int x = 0; x < image.width(); ++x)
+                if (row[x * 4 + 3] != 255)
+                    return false;
+            break;
+        case QImage::Format_RGBA64:
+        case QImage::Format_RGBA64_Premultiplied: {
+            const auto *pixels = reinterpret_cast<const QRgba64 *>(row);
+            for (int x = 0; x < image.width(); ++x)
+                if (pixels[x].alpha() != 65535)
+                    return false;
+            break;
+        }
+        case QImage::Format_Alpha8:
+            for (int x = 0; x < image.width(); ++x)
+                if (row[x] != 255)
+                    return false;
+            break;
+        default:
+            for (int x = 0; x < image.width(); ++x)
+                if (image.pixelColor(x, y).alphaF() != 1.0)
+                    return false;
+            break;
+        }
+    }
+    return true;
+}
+
 QPainterPath Annotation::effectPath() const {
     QPainterPath path;
     if (shape == 3 && !points.isEmpty()) {
@@ -205,8 +267,9 @@ QImage Document::render(bool frame) const {
         transform.translate(rect.center().x(), rect.center().y());
         transform.rotate(item.rotation);
         transform.translate(-rect.center().x(), -rect.center().y());
-        const QRect effectRegion = transform.map(item.effectPath()).boundingRect().toAlignedRect()
-                                       .intersected(canvas.rect());
+        const QPainterPath effectPath = effect || item.tool == Tool::Eraser ? item.effectPath() : QPainterPath();
+        const QRect effectRegion = effect ? transform.map(effectPath).boundingRect().toAlignedRect()
+                                               .intersected(canvas.rect()) : QRect();
         QRect sampleRegion = effectRegion;
         if (item.tool == Tool::Magnify && !effectRegion.isEmpty()) {
             const QSize size(qMax(1, effectRegion.width() / 2), qMax(1, effectRegion.height() / 2));
@@ -256,7 +319,7 @@ QImage Document::render(bool frame) const {
         }
         case Tool::Eraser:
             // Restore the source at the same image coordinates, including its original alpha.
-            painter.setClipPath(item.effectPath());
+            painter.setClipPath(effectPath);
             painter.resetTransform();
             painter.setCompositionMode(QPainter::CompositionMode_Source);
             painter.drawImage(QPoint(0, 0), image);
@@ -278,12 +341,12 @@ QImage Document::render(bool frame) const {
                 patch = gaussianBlur(patch, qRound(item.width * 2));
             else
                 patch = patch.scaled(region.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-            painter.setClipPath(item.effectPath());
+            painter.setClipPath(effectPath);
             painter.resetTransform();
             painter.drawImage(region.topLeft(), patch);
             if (item.tool == Tool::Magnify) {
                 painter.setTransform(transform);
-                painter.drawPath(item.effectPath());
+                painter.drawPath(effectPath);
             }
             break;
         }

@@ -145,7 +145,7 @@ void AnnotationCanvas::setStyle(const Annotation &style) {
             if (next.tool == Tool::Number)
                 next.rect.moveCenter(item.rect.center());
         }
-        if (next.toJson() == item.toJson())
+        if (next.sameContent(item))
             return;
         // A live drawing already has its creation snapshot. A completed object gets its own style edit.
         if (!drawing() && (!styleChanging_ || !styleCheckpoint_)) {
@@ -172,11 +172,16 @@ void AnnotationCanvas::endStyleChange() {
 }
 void AnnotationCanvas::setZoom(double zoom) {
     zoom_ = qBound(0.0001, zoom, 8.0);
-    setFixedSize(qMax(1, qRound(document_.image.width() * zoom_)),
-                 qMax(1, qRound(document_.image.height() * zoom_)));
-    if (gpuPreview_)
-        gpuPreview_->setGeometry(rect());
+    updateCanvasSize();
     update();
+}
+void AnnotationCanvas::updateCanvasSize() {
+    const QSize target(qMax(1, qRound(document_.image.width() * zoom_)),
+                       qMax(1, qRound(document_.image.height() * zoom_)));
+    if (minimumSize() != target || maximumSize() != target)
+        setFixedSize(target);
+    if (gpuPreview_ && gpuPreview_->geometry() != rect())
+        gpuPreview_->setGeometry(rect());
 }
 double AnnotationCanvas::zoom() const {
     return zoom_;
@@ -191,6 +196,8 @@ void AnnotationCanvas::setBaseImage(const QImage &image) {
     }
 }
 void AnnotationCanvas::setCaptureBackground(const Document &background, const QPointF &annotationOffset) {
+    const bool pixelsChanged = document_.image.cacheKey() != background.image.cacheKey() ||
+                               document_.cornerRadius != background.cornerRadius || !annotationOffset.isNull();
     if (!annotationOffset.isNull()) {
         for (auto &item : document_.annotations)
             translate(item, annotationOffset);
@@ -203,7 +210,8 @@ void AnnotationCanvas::setCaptureBackground(const Document &background, const QP
     document_.cornerRadius = background.cornerRadius;
     document_.detectedElements = background.detectedElements;
     document_.sourceRect = background.sourceRect;
-    redraw();
+    if (pixelsChanged)
+        redraw();
 }
 void AnnotationCanvas::setDocument(const Document &document) {
     endStyleChange();
@@ -232,9 +240,12 @@ void AnnotationCanvas::checkpoint() {
         undo_.removeFirst();
     redo_.clear();
 }
-void AnnotationCanvas::redraw() {
+void AnnotationCanvas::redraw(bool preserveStrokeBounds) {
+    // Changes outside the current mouse stroke may replace or transform its point list.
+    if (!preserveStrokeBounds)
+        strokeBoundsValid_ = false;
     rendered_ = document_.render();
-    setZoom(zoom_);
+    updateCanvasSize();
     update();
     emit changed();
 }
@@ -258,7 +269,7 @@ void AnnotationCanvas::redo() {
     document_.annotations = redo_.takeLast();
     selected_ = -1;
     for (int i = 0; i < document_.annotations.size(); ++i)
-        if (i >= previous.size() || document_.annotations[i].toJson() != previous[i].toJson()) {
+        if (i >= previous.size() || !document_.annotations[i].sameContent(previous[i])) {
             if (document_.annotations[i].tool != Tool::Eraser)
                 selected_ = i;
             break;
@@ -434,9 +445,16 @@ void AnnotationCanvas::paintEvent(QPaintEvent *) {
     paintContent(painter);
 }
 void AnnotationCanvas::paintContent(QPainter &painter) {
-    for (int y = 0; y < height(); y += 16)
-        for (int x = 0; x < width(); x += 16)
-            painter.fillRect(x, y, 16, 16, ((x / 16 + y / 16) % 2) ? QColor("#e4e4e4") : QColor("#f5f5f5"));
+    static const QBrush checkerboard([] {
+        QImage tile(32, 32, QImage::Format_RGB32);
+        tile.fill(QColor("#f5f5f5"));
+        QPainter painter(&tile);
+        painter.fillRect(16, 0, 16, 16, QColor("#e4e4e4"));
+        painter.fillRect(0, 16, 16, 16, QColor("#e4e4e4"));
+        painter.end();
+        return tile;
+    }());
+    painter.fillRect(rect(), checkerboard);
     painter.scale(zoom_, zoom_);
     painter.setRenderHint(QPainter::SmoothPixmapTransform, zoom_ < 1);
     painter.drawImage(0, 0, rendered_);
@@ -628,6 +646,7 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
     auto &item = document_.annotations[selected_];
     const bool pendingTransform = (moving_ || resizing_ || rotating_) && !transformCheckpoint_;
     const Annotation before = pendingTransform ? item : Annotation();
+    bool nextStrokeBoundsValid = false;
     if (moving_)
         translate(item, point - previous_);
     else if (rotating_) {
@@ -701,20 +720,27 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
                                         point.y() >= anchor_.y() ? side : -side);
             }
         }
-        if (brush && !event->modifiers().testFlag(Qt::ShiftModifier))
+        const bool appendOnly = brush && !event->modifiers().testFlag(Qt::ShiftModifier);
+        // Continue the same min/max operations as a full scan, without revisiting its prefix.
+        const bool extendBounds = appendOnly && strokeBoundsValid_;
+        const QRectF previousBounds = item.rect;
+        if (appendOnly)
             item.points.append(end);
         else if (!item.points.isEmpty())
             item.points.last() = end;
         item.rect = QRectF(anchor_, end).normalized();
         if (!item.points.isEmpty()) {
-            QRectF bounds(item.points.first(), QSizeF(0, 0));
-            for (const auto &p : item.points) {
+            QRectF bounds = extendBounds ? previousBounds : QRectF(item.points.first(), QSizeF(0, 0));
+            const int start = extendBounds ? item.points.size() - 1 : 0;
+            for (int i = start; i < item.points.size(); ++i) {
+                const QPointF &p = item.points[i];
                 bounds.setLeft(qMin(bounds.left(), p.x()));
                 bounds.setRight(qMax(bounds.right(), p.x()));
                 bounds.setTop(qMin(bounds.top(), p.y()));
                 bounds.setBottom(qMax(bounds.bottom(), p.y()));
             }
             item.rect = bounds;
+            nextStrokeBoundsValid = brush;
         }
     } else {
         if (picker_ || magnifier_)
@@ -722,14 +748,15 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
         return;
     }
     previous_ = point;
-    if (pendingTransform && item.toJson() != before.toJson()) {
+    strokeBoundsValid_ = nextStrokeBoundsValid;
+    if (pendingTransform && !item.sameContent(before)) {
         const Annotation transformed = item;
         item = before;
         checkpoint();
         document_.annotations[selected_] = transformed;
         transformCheckpoint_ = true;
     }
-    redraw();
+    redraw(true);
 }
 void AnnotationCanvas::mouseReleaseEvent(QMouseEvent *event) {
     if (event->button() != Qt::LeftButton)

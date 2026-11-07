@@ -77,7 +77,7 @@ BOOL CALLBACK findWindow(HWND window, LPARAM parameter) {
 }
 
 LRESULT CALLBACK mouseProcedure(int code, WPARAM message, LPARAM data) {
-    if (code == HC_ACTION && inputInstance) {
+    if (code == HC_ACTION && inputInstance && (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)) {
         const auto *event = reinterpret_cast<MSLLHOOKSTRUCT *>(data);
         const bool alt = GetAsyncKeyState(VK_MENU) & 0x8000;
         const bool shift = GetAsyncKeyState(VK_SHIFT) & 0x8000;

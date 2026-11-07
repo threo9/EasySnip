@@ -65,7 +65,8 @@ class AnnotationCanvas : public QWidget {
 
   private:
     void checkpoint();
-    void redraw();
+    void updateCanvasSize();
+    void redraw(bool preserveStrokeBounds = false);
     void paintContent(QPainter &painter);
     int objectAt(const QPointF &point) const;
     bool matchElement(const QPointF &point);
@@ -95,6 +96,7 @@ class AnnotationCanvas : public QWidget {
     bool magnifier_ = false;
     bool altUsed_ = false;
     bool penStraight_ = false;
+    bool strokeBoundsValid_ = false;
     bool styleChanging_ = false;
     bool styleCheckpoint_ = false;
     QPointF anchor_;

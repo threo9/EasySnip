@@ -7,6 +7,8 @@
 #include <BitMatrix.h>
 #include <windows.h>
 #include <shellapi.h>
+#include <cmath>
+#include <limits>
 
 namespace {
 Document sampleDocument() {
@@ -83,6 +85,182 @@ int runSelfTests(const QString &directory, bool native) {
             ++failures;
         QTextStream(stdout) << (result ? "PASS " : "FAIL ") << name << '\n';
     };
+    {
+        for (auto format : {QImage::Format_ARGB32, QImage::Format_ARGB32_Premultiplied,
+                            QImage::Format_RGBA8888, QImage::Format_RGBA8888_Premultiplied,
+                            QImage::Format_RGBA64, QImage::Format_RGBA64_Premultiplied,
+                            QImage::Format_Alpha8, QImage::Format_ARGB4444_Premultiplied,
+                            QImage::Format_A2RGB30_Premultiplied}) {
+            QImage image(7, 3, format);
+            image.fill(QColor(40, 80, 120, 255));
+            check("full opacity scan format " + QString::number(format), hasOnlyOpaquePixels(image));
+            image.setPixelColor(6, 2, QColor(40, 80, 120, 128));
+            check("opacity scan includes final pixel format " + QString::number(format), !hasOnlyOpaquePixels(image));
+        }
+        QImage palette(7, 3, QImage::Format_Indexed8);
+        palette.setColorTable({qRgb(0, 0, 0), qRgba(200, 30, 60, 127)});
+        palette.fill(0);
+        check("unused translucent palette entries preserve opaque pixels", hasOnlyOpaquePixels(palette));
+        palette.setPixel(6, 2, 1);
+        check("opacity scan reads indexed pixel alpha", !hasOnlyOpaquePixels(palette));
+        QImage precise(7, 3, QImage::Format_RGBA64);
+        precise.fill(Qt::white);
+        reinterpret_cast<QRgba64 *>(precise.scanLine(2))[6] = QRgba64::fromRgba64(1000, 2000, 3000, 65534);
+        check("opacity scan preserves 16-bit near-opaque alpha", !hasOnlyOpaquePixels(precise));
+        QImage rgb(7, 3, QImage::Format_RGB32);
+        rgb.fill(Qt::white);
+        check("RGB images take the opaque fast path", hasOnlyOpaquePixels(rgb));
+    }
+    {
+        Annotation original;
+        original.rect = QRectF(1, 2, 30, 40);
+        original.points = {{1, 2}, {30, 40}};
+        QVector<Annotation> variants{original};
+        auto variant = [&](const std::function<void(Annotation &)> &change) {
+            Annotation item = original;
+            change(item);
+            variants.append(item);
+        };
+        variant([](Annotation &a) { a.tool = Tool::Arrow; });
+        variant([](Annotation &a) { a.rect.translate(1e-13, 0); });
+        variant([](Annotation &a) { a.rect.setHeight(41); });
+        variant([](Annotation &a) { a.points[0].setX(1 + 1e-13); });
+        variant([](Annotation &a) { a.points.append({50, 60}); });
+        variant([](Annotation &a) { a.color.setAlpha(127); });
+        variant([](Annotation &a) { a.fill = QColor("#123456"); });
+        variant([](Annotation &a) { a.outline = Qt::red; });
+        variant([](Annotation &a) { a.width += 1; });
+        variant([](Annotation &a) { a.rotation = 15; });
+        variant([](Annotation &a) { a.fontSize += 1; });
+        variant([](Annotation &a) { a.outlineWidth = 2; });
+        variant([](Annotation &a) { a.lineStyle = int(Qt::DashLine); });
+        variant([](Annotation &a) { a.shape = 3; });
+        variant([](Annotation &a) { a.arrowStyle = 2; });
+        variant([](Annotation &a) { a.number = 9; });
+        variant([](Annotation &a) { a.text = QStringLiteral("精确比较\n第二行"); });
+        bool equivalent = true;
+        for (const auto &left : variants)
+            for (const auto &right : variants)
+                equivalent = equivalent && left.sameContent(right) == (left.toJson() == right.toJson());
+        check("annotation field comparison matches every serialized field", equivalent);
+        check("annotation comparison preserves subpixel coordinate differences",
+              !original.sameContent(variants[2]) && !original.sameContent(variants[4]));
+        Annotation rgb = original, hsv = original;
+        hsv.color = rgb.color.toHsv();
+        check("annotation colors retain serialized RGBA comparison",
+              rgb.sameContent(hsv) == (rgb.toJson() == hsv.toJson()));
+        const double special[] = {0, -0.0, std::numeric_limits<double>::quiet_NaN(),
+                                  std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
+        equivalent = true;
+        for (double left : special)
+            for (double right : special) {
+                Annotation a = original, b = original;
+                a.width = left;
+                b.width = right;
+                equivalent = equivalent && a.sameContent(b) == (a.toJson() == b.toJson());
+            }
+        check("annotation special numbers retain JSON equality semantics", equivalent);
+    }
+    {
+        Document source;
+        source.image = QImage(512, 256, QImage::Format_RGB32);
+        source.image.fill(Qt::white);
+        AnnotationCanvas stroke(source, settings);
+        stroke.setAttribute(Qt::WA_DontShowOnScreen);
+        stroke.show();
+        stroke.setTool(Tool::Pen);
+        QTest::mousePress(&stroke, Qt::LeftButton, {}, {10, 20});
+        QVector<QPointF> points{{10, 20}, {10, 20}};
+        bool straightBefore = false, exact = true;
+        for (int i = 0; i < 200; ++i) {
+            const QPointF point(12 + i, 20 + (i * 17) % 70);
+            const bool straight = (i >= 35 && i < 55) || (i >= 110 && i < 130);
+            if (straight && !straightBefore)
+                points.append(point);
+            QPointF end = point;
+            if (straight) {
+                const QPointF start = points[points.size() - 2];
+                const double radians = qRound(std::atan2(point.y() - start.y(), point.x() - start.x()) /
+                                             (M_PI / 4)) * M_PI / 4;
+                const double length = QLineF(start, point).length();
+                end = start + QPointF(std::cos(radians) * length, std::sin(radians) * length);
+                points.last() = end;
+            } else
+                points.append(end);
+            straightBefore = straight;
+            if (i == 75) {
+                auto style = stroke.style();
+                style.width += 1;
+                stroke.setStyle(style);
+            }
+            QMouseEvent move(QEvent::MouseMove, point, Qt::NoButton, Qt::LeftButton,
+                             straight ? Qt::ShiftModifier : Qt::NoModifier);
+            QApplication::sendEvent(&stroke, &move);
+            const auto &actual = stroke.document().annotations.last();
+            Annotation expected = actual;
+            expected.points = points;
+            QRectF bounds(points.first(), QSizeF(0, 0));
+            for (const auto &p : points) {
+                bounds.setLeft(qMin(bounds.left(), p.x()));
+                bounds.setRight(qMax(bounds.right(), p.x()));
+                bounds.setTop(qMin(bounds.top(), p.y()));
+                bounds.setBottom(qMax(bounds.bottom(), p.y()));
+            }
+            expected.rect = bounds;
+            exact = exact && actual.toJson() == expected.toJson();
+        }
+        QTest::mouseRelease(&stroke, Qt::LeftButton, {}, {211, 43});
+        check("incremental stroke bounds retain every point and exact Shift geometry", exact);
+        const Document finished = stroke.document();
+        stroke.undo();
+        stroke.redo();
+        check("incremental stroke bounds retain undo redo and rendered pixels",
+              stroke.document().toJson() == finished.toJson() && stroke.document().render() == finished.render());
+        stroke.setTool(Tool::Pen);
+        QTest::mousePress(&stroke, Qt::LeftButton, {}, {350, 120});
+        QMouseEvent move(QEvent::MouseMove, QPointF(390, 150), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&stroke, &move);
+        QTest::mouseRelease(&stroke, Qt::LeftButton, {}, {390, 150});
+        check("new strokes reset bounds after history operations",
+              stroke.document().annotations.last().rect == QRectF(350, 120, 40, 30));
+    }
+    {
+        const QIcon icon = Ui::toolIcon(Tool::Number);
+        check("unchanged icons reuse all rendered states", icon.cacheKey() == Ui::toolIcon(Tool::Number).cacheKey() &&
+              Ui::commandIcon("copy").cacheKey() == Ui::commandIcon("copy").cacheKey() &&
+              Ui::lineStyleIcon(true).cacheKey() == Ui::lineStyleIcon(true).cacheKey() &&
+              Ui::fillModeIcon(true).cacheKey() == Ui::fillModeIcon(true).cacheKey());
+        const QString accent = settings.value("appearance/accent", "#0067c0").toString();
+        settings.set("appearance/accent", "#e63946");
+        applyAppearance(settings);
+        const QIcon recolored = Ui::toolIcon(Tool::Number);
+        check("icon cache follows accent changes", icon.cacheKey() != recolored.cacheKey() &&
+              icon.pixmap(24, 24, QIcon::Normal, QIcon::On).toImage() !=
+                  recolored.pixmap(24, 24, QIcon::Normal, QIcon::On).toImage());
+        settings.set("appearance/uiScale", 1.5);
+        applyAppearance(settings);
+        check("icon cache follows UI scale changes", recolored.cacheKey() != Ui::toolIcon(Tool::Number).cacheKey());
+        settings.set("appearance/accent", accent);
+        settings.set("appearance/uiScale", 1.0);
+        applyAppearance(settings);
+        class AppearanceEvents : public QObject {
+          public:
+            int changes = 0;
+            bool eventFilter(QObject *, QEvent *event) override {
+                if (event->type() == QEvent::StyleChange || event->type() == QEvent::PaletteChange ||
+                    event->type() == QEvent::FontChange)
+                    ++changes;
+                return false;
+            }
+        } events;
+        QWidget witness;
+        witness.ensurePolished();
+        QCoreApplication::processEvents();
+        witness.installEventFilter(&events);
+        applyAppearance(settings);
+        QCoreApplication::processEvents();
+        check("unchanged appearance does not repolish widgets", events.changes == 0);
+    }
     auto document = sampleDocument();
     Annotation rectangle;
     rectangle.tool = Tool::RoundedRectangle;
@@ -113,6 +291,36 @@ int runSelfTests(const QString &directory, bool native) {
     check("rounded corner alpha",
           qAlpha(rounded.render().pixel(0, 0)) == 0 && qAlpha(rounded.render().pixel(440, 260)) == 255);
     check("frame output size", document.render(true).size() == document.image.size() + QSize(48, 48));
+    {
+        Document transparent;
+        transparent.image = QImage(67, 53, QImage::Format_ARGB32);
+        for (int y = 0; y < transparent.image.height(); ++y)
+            for (int x = 0; x < transparent.image.width(); ++x)
+                transparent.image.setPixel(x, y, qRgba(x * 3, y * 4, (x + y) * 2, (x * 5 + y * 7) % 256));
+        AnnotationCanvas view(transparent, settings);
+        view.setAttribute(Qt::WA_DontShowOnScreen);
+        view.show();
+        for (double zoom : {0.5, 1.0, 1.75, 2.0}) {
+            view.setZoom(zoom);
+            const QImage actual = view.grab().toImage().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            QImage expected(view.size(), actual.format());
+            QPainter painter(&expected);
+            for (int y = 0; y < expected.height(); y += 16)
+                for (int x = 0; x < expected.width(); x += 16)
+                    painter.fillRect(x, y, 16, 16, ((x / 16 + y / 16) % 2) ? QColor("#e4e4e4") : QColor("#f5f5f5"));
+            painter.scale(zoom, zoom);
+            painter.setRenderHint(QPainter::SmoothPixmapTransform, zoom < 1);
+            painter.drawImage(0, 0, transparent.render());
+            painter.end();
+            check("tiled transparency background preserves every pixel at zoom " + QString::number(zoom), actual == expected);
+        }
+        view.setZoom(1);
+        transparent.image = QImage(91, 61, QImage::Format_ARGB32);
+        transparent.image.fill(Qt::transparent);
+        view.setDocument(transparent);
+        check("canvas size follows new image without zoom changes", view.size() == transparent.image.size() &&
+              view.minimumSize() == view.size() && view.maximumSize() == view.size());
+    }
     auto erased = document;
     Annotation eraser;
     eraser.tool = Tool::Eraser;
@@ -293,6 +501,52 @@ int runSelfTests(const QString &directory, bool native) {
     Library library(settings);
     const QString id = library.add(document);
     check("atomic history write", !id.isEmpty() && library.document(id).render() == rendered);
+    {
+        Settings cachedSettings(temporary.path() + "/cached-history");
+        Library cached(cachedSettings);
+        const QImage unframed = rounded.render();
+        const QImage preview = unframed.scaled(320, 220, Qt::KeepAspectRatio, Qt::SmoothTransformation)
+                                   .convertToFormat(QImage::Format_ARGB32);
+        const QString cachedId = cached.add(rounded, unframed);
+        const Document reopened = cached.document(cachedId);
+        check("reused preview keeps the original editable source", !cachedId.isEmpty() &&
+              reopened.image == rounded.image && reopened.toJson() == rounded.toJson() && reopened.render() == unframed);
+        check("reused preview preserves every pixel and alpha",
+              QImage(cached.previewPath(cached.record(cachedId))).convertToFormat(QImage::Format_ARGB32) == preview);
+        check("history update accepts the matching unframed rendering", cached.updateDocument(cachedId, rounded, unframed) &&
+              QImage(cached.previewPath(cached.record(cachedId))).convertToFormat(QImage::Format_ARGB32) == preview);
+        const QString framedId = cached.add(rounded, rounded.render(true));
+        check("framed images are not used for unframed history previews",
+              QImage(cached.previewPath(cached.record(framedId))).convertToFormat(QImage::Format_ARGB32) == preview);
+        LibraryWindow hidden(cached, cachedSettings);
+        hidden.setAttribute(Qt::WA_DontShowOnScreen);
+        auto *gallery = hidden.findChild<QListWidget *>("historyGallery");
+        check("hidden history delays initial item creation", gallery && gallery->count() == 0);
+        hidden.show();
+        check("history fills before its first visible frame", gallery->count() == 2);
+        hidden.hide();
+        cached.add(rounded, unframed);
+        check("hidden history defers updates", gallery->count() == 2);
+        hidden.show();
+        check("showing history includes deferred additions", gallery->count() == 3);
+        hidden.hide();
+        QSignalSpy changes(&cached, &Library::changed);
+        cachedSettings.set("history/limit", 1);
+        cached.prune();
+        check("batch prune sends one history update", changes.count() == 1 && cached.records().size() == 1);
+        changes.clear();
+        cached.prune();
+        check("pruning within the limit does not refresh history", changes.isEmpty());
+        hidden.show();
+        check("showing history includes deferred removals", gallery->count() == 1);
+        hidden.hide();
+        cached.add(rounded, unframed);
+        changes.clear();
+        cached.clearHistory();
+        check("batch clear sends one history update", changes.count() == 1 && cached.records().isEmpty());
+        hidden.show();
+        check("deferred history clear shows its empty state", gallery->count() == 0 && gallery->isHidden());
+    }
     auto record = library.record(id);
     record.title = QStringLiteral("截图测试");
     library.updateRecord(record);
@@ -704,6 +958,78 @@ int runSelfTests(const QString &directory, bool native) {
                   editable.document().annotations.first().toJson() == label.toJson());
         }
         editable.hide();
+    }
+    {
+        Settings cachedSettings(temporary.path() + "/cached-capture");
+        cachedSettings.set("magnifier/enabled", false);
+        Native::Desktop snapshot;
+        snapshot.geometry = QRect(-180, 70, 160, 120);
+        snapshot.screens = {snapshot.geometry};
+        snapshot.image = QImage(snapshot.geometry.size(), QImage::Format_RGB32);
+        for (int y = 0; y < snapshot.image.height(); ++y)
+            for (int x = 0; x < snapshot.image.width(); ++x)
+                snapshot.image.setPixel(x, y, qRgb(x, y, (x + y) % 256));
+        snapshot.cursorImage = QImage(7, 9, QImage::Format_ARGB32_Premultiplied);
+        snapshot.cursorImage.fill(QColor(240, 30, 60, 128));
+        snapshot.cursorPosition = QPoint(-145, 102);
+        snapshot.cursorHotspot = QPoint(2, 3);
+        CaptureOverlay cached(snapshot, cachedSettings, QRect(-160, 90, 80, 60));
+        cached.setAttribute(Qt::WA_DontShowOnScreen);
+        auto reference = [&] {
+            QImage image = cached.desktop_.image;
+            if (cached.cursor_) {
+                QPainter painter(&image);
+                painter.drawImage(cached.desktop_.cursorPosition - cached.desktop_.geometry.topLeft() -
+                                      cached.desktop_.cursorHotspot, cached.desktop_.cursorImage);
+            }
+            return image;
+        };
+        check("pointer disabled preserves the original desktop image",
+              cached.backgroundImage().cacheKey() == snapshot.image.cacheKey());
+        cached.cursor_ = true;
+        const QImage composed = cached.backgroundImage();
+        check("cached cursor composition preserves every pixel", composed == reference());
+        check("unchanged pointer background reuses its composition",
+              composed.cacheKey() == cached.backgroundImage().cacheKey());
+        const QImage crop = cached.selectionBackground().image;
+        check("cached selection crop preserves every pixel", crop == reference().copy(cached.selection_));
+        check("unchanged selection reuses its source pixels", crop.cacheKey() == cached.selectionBackground().image.cacheKey());
+        cached.syncSelection();
+        auto *canvas = cached.findChild<AnnotationCanvas *>();
+        QSignalSpy changes(canvas, &AnnotationCanvas::changed);
+        cached.syncSelection();
+        check("unchanged capture background avoids redundant rendering", changes.isEmpty());
+        cached.selection_.translate(6, 4);
+        cached.syncSelection();
+        check("moving the selection refreshes the entire background", changes.count() == 1 &&
+              canvas->document().image == reference().copy(cached.selection_) &&
+              canvas->document().sourceRect == cached.selectedGlobal());
+        cached.desktop_.cursorHotspot += QPoint(1, 0);
+        check("pointer cache follows hotspot changes", cached.backgroundImage() == reference());
+        cached.desktop_.geometry.translate(-5, 0);
+        check("pointer cache follows negative desktop origin changes", cached.backgroundImage() == reference());
+        cached.desktop_.cursorPosition += QPoint(3, 0);
+        check("pointer cache follows captured cursor movement", cached.backgroundImage() == reference());
+        cached.desktop_.cursorImage.fill(QColor(20, 80, 220, 96));
+        check("pointer cache follows cursor image changes", cached.backgroundImage() == reference());
+        cached.desktop_.image.fill(QColor("#d1e2f3"));
+        check("pointer cache follows refreshed desktop pixels", cached.backgroundImage() == reference());
+        cached.syncSelection();
+        changes.clear();
+        cached.radius_ = 8;
+        cached.syncSelection();
+        check("unchanged source pixels still apply new corner alpha", changes.count() == 1 &&
+              canvas->document().cornerRadius == 8 && qAlpha(canvas->document().render().pixel(0, 0)) == 0);
+        cached.cursor_ = false;
+        cached.syncSelection();
+        check("pointer toggle restores unmodified screenshot pixels",
+              canvas->document().image == cached.desktop_.image.copy(cached.selection_));
+        changes.clear();
+        cached.elements_ = true;
+        cached.detectedElements_ = {cached.selectedGlobal().adjusted(4, 5, -6, -7)};
+        cached.syncSelection();
+        check("detection metadata updates without rerendering unchanged pixels", changes.isEmpty() &&
+              canvas->document().detectedElements == QVector<QRect>{QRect(4, 5, 70, 48)});
     }
     Native::Desktop desktop;
     desktop.image = sampleDocument().image;
@@ -1767,6 +2093,88 @@ int runSelfTests(const QString &directory, bool native) {
         } hiddenWindows;
         qApp->installEventFilter(&hiddenWindows);
         {
+            Settings saveSettings(temporary.path() + "/save-equivalence");
+            saveSettings.set("hotkeys/enabled", false);
+            saveSettings.set("capture/superDrag", false);
+            saveSettings.set("general/tray", false);
+            saveSettings.set("general/notifications", false);
+            Application saver(saveSettings);
+            auto legacyBytes = [&](const QImage &source, const QByteArray &format, bool metadata, bool removeAlpha) {
+                QImage image = source;
+                if (format == "jpg" || format == "bmp") {
+                    QImage flat(image.size(), QImage::Format_RGB32);
+                    flat.fill(Qt::white);
+                    QPainter painter(&flat);
+                    painter.drawImage(0, 0, image);
+                    painter.end();
+                    image = flat;
+                } else if (removeAlpha && image.hasAlphaChannel()) {
+                    bool opaque = true;
+                    for (int y = 0; y < image.height() && opaque; ++y)
+                        for (int x = 0; x < image.width(); ++x)
+                            if (qAlpha(image.pixel(x, y)) != 255) {
+                                opaque = false;
+                                break;
+                            }
+                    if (opaque)
+                        image = image.convertToFormat(QImage::Format_RGB32);
+                }
+                if (metadata)
+                    image.setText("Software", "EasySnip 0.1.0 / Qt 5.14.2");
+                QByteArray bytes;
+                QBuffer buffer(&bytes);
+                buffer.open(QIODevice::WriteOnly);
+                QImageWriter writer(&buffer, format);
+                writer.setQuality(95);
+                return writer.write(image) ? bytes : QByteArray();
+            };
+            for (const QByteArray format : {QByteArray("png"), QByteArray("jpg"), QByteArray("bmp")})
+                for (bool metadata : {false, true})
+                    for (int existing = 0; existing < 4; ++existing) {
+                        QImage source(31, 19, QImage::Format_ARGB32);
+                        for (int y = 0; y < source.height(); ++y)
+                            for (int x = 0; x < source.width(); ++x)
+                                source.setPixel(x, y, qRgba(x * 7, y * 11, (x + y) * 3, (x * 17 + y * 13) % 256));
+                        source.setDotsPerMeterX(3780);
+                        source.setDotsPerMeterY(4724);
+                        source.setText("Author", QStringLiteral("作者信息"));
+                        source.setText("Description", QStringLiteral("保留元数据\n第二行"));
+                        if (existing)
+                            source.setText("Software", existing == 1 ? "Previous software" :
+                                           existing == 2 ? "EasySnip 0.1.0 / Qt 5.14.2" : "");
+                        const QImage unchanged = source;
+                        saveSettings.set("output/metadata", metadata);
+                        const QString path = temporary.path() + "/save-" + format + '-' + QString::number(metadata) +
+                                             '-' + QString::number(existing) + '.' + format;
+                        const bool saved = saver.saveImage(source, path);
+                        QFile file(path);
+                        file.open(QIODevice::ReadOnly);
+                        check("saved bytes retain pixels and metadata " + QString::fromLatin1(format) + '-' +
+                                  QString::number(metadata) + '-' + QString::number(existing),
+                              saved && file.readAll() == legacyBytes(source, format, metadata, true) &&
+                              source == unchanged && source.text("Software") == unchanged.text("Software"));
+                    }
+            QImage opaque(7, 3, QImage::Format_ARGB32_Premultiplied);
+            opaque.fill(QColor(12, 34, 56));
+            for (bool remove : {false, true}) {
+                saveSettings.set("output/removeOpaqueAlpha", remove);
+                saveSettings.set("output/metadata", true);
+                const QString path = temporary.path() + "/opaque-" + QString::number(remove) + ".png";
+                const bool saved = saver.saveImage(opaque, path);
+                QFile file(path);
+                file.open(QIODevice::ReadOnly);
+                check("opaque PNG retains alpha-removal option " + QString::number(remove),
+                      saved && file.readAll() == legacyBytes(opaque, "png", true, remove));
+            }
+            QImage precise(7, 3, QImage::Format_RGBA64);
+            precise.fill(Qt::white);
+            reinterpret_cast<QRgba64 *>(precise.scanLine(2))[6] = QRgba64::fromRgba64(1000, 2000, 3000, 65534);
+            saveSettings.set("output/removeOpaqueAlpha", true);
+            const QString path = temporary.path() + "/precise-alpha.png";
+            check("PNG export preserves near-opaque 16-bit alpha", saver.saveImage(precise, path) &&
+                  QImage(path).convertToFormat(QImage::Format_RGBA64) == precise);
+        }
+        {
             Settings startupSettings(temporary.path() + "/startup");
             startupSettings.set("hotkeys/enabled", false);
             startupSettings.set("capture/superDrag", false);
@@ -2155,9 +2563,19 @@ int runSelfTests(const QString &directory, bool native) {
         check("unowned shortcut messages are ignored", !input.nativeEventFilter({}, &hotkey, &result));
         check("reserved key rejected without error pointer", !input.registerShortcut(103, QKeySequence("F12"), nullptr));
         activated.clear();
-        const bool f1Registered = input.registerShortcut(103, QKeySequence("F1"), &error);
-        check("F1 system-wide registration", f1Registered);
-        if (f1Registered) {
+        QString dispatchKey = "F1";
+        UINT dispatchVk = VK_F1;
+        bool occupied = false;
+        bool dispatchRegistered = input.registerShortcut(103, QKeySequence(dispatchKey), &error, &occupied);
+        if (!dispatchRegistered && occupied) {
+            // Keep an existing screenshot utility running while testing real input dispatch.
+            check("occupied F1 reports the external shortcut conflict", error.contains("1409"));
+            dispatchKey = "F13";
+            dispatchVk = VK_F13;
+            dispatchRegistered = input.registerShortcut(103, QKeySequence(dispatchKey), &error);
+        }
+        check(dispatchKey + " system-wide registration", dispatchRegistered);
+        if (dispatchRegistered) {
             // SendInput must target a window at this process's integrity level.
             HWND inputTarget = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", L"EasySnip hotkey test",
                                                WS_POPUP | WS_VISIBLE, -32000, -32000, 1, 1,
@@ -2167,18 +2585,18 @@ int runSelfTests(const QString &directory, bool native) {
             INPUT events[3]{};
             for (auto &event : events) {
                 event.type = INPUT_KEYBOARD;
-                event.ki.wVk = VK_F1;
+                event.ki.wVk = WORD(dispatchVk);
             }
             events[2].ki.dwFlags = KEYEVENTF_KEYUP;
             const UINT sent = SendInput(3, events, sizeof(INPUT));
             QTest::qWait(150);
-            check("F1 reaches Qt native dispatcher once per press", sent == 3 && activated.count() == 1 &&
+            check(dispatchKey + " reaches Qt native dispatcher once per press", sent == 3 && activated.count() == 1 &&
                   activated.first().first().toInt() == 103);
             DestroyWindow(inputTarget);
         }
         input.clear();
-        const bool released = RegisterHotKey(nullptr, 0x7e01, MOD_NOREPEAT, VK_F1);
-        check("F1 released on input shutdown", released);
+        const bool released = RegisterHotKey(nullptr, 0x7e01, MOD_NOREPEAT, dispatchVk);
+        check(dispatchKey + " released on input shutdown", released);
         if (released)
             UnregisterHotKey(nullptr, 0x7e01);
         QWidget shareOwner;

@@ -6,21 +6,21 @@
 #include <QVector>
 
 enum class Tool {
-    Select,
-    Rectangle,
-    Ellipse,
-    RoundedRectangle,
-    Line,
-    Arrow,
-    Polyline,
-    Pen,
-    Highlighter,
-    Mosaic,
-    Blur,
-    Eraser,
-    Text,
-    Number,
-    Magnify
+    Select = 0,
+    Rectangle = 1,
+    Ellipse = 2,
+    RoundedRectangle = 3,
+    Line = 4,
+    Arrow = 5,
+    Polyline = 6,
+    Pen = 7,
+    // Serialized ID 8 is retired; keep subsequent tools compatible with existing records.
+    Mosaic = 9,
+    Blur = 10,
+    Eraser = 11,
+    Text = 12,
+    Number = 13,
+    Magnify = 14
 };
 QString toolName(Tool tool);
 QString toolKey(Tool tool);

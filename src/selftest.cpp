@@ -38,7 +38,7 @@ Document sampleDocument() {
                                      QStringLiteral("交付验证")}[i]);
         painter.setPen(QColor("#6a7e97"));
         painter.drawText(QRect(60 + i * 278, 270, 212, 130), Qt::TextWordWrap,
-                         QStringLiteral("整理截图与参考资料\n高亮重要信息\n保存并回看历史"));
+                         QStringLiteral("整理截图与参考资料\n标记重要信息\n保存并回看历史"));
         painter.setBrush(QColor("#d8f3e9"));
         painter.setPen(Qt::NoPen);
         painter.drawRoundedRect(QRect(60 + i * 278, 390, 100, 28), 8, 8);
@@ -117,6 +117,56 @@ int runSelfTests(const QString &directory, bool native) {
     eraser.rect = QRectF(10, 10, 50, 50);
     erased.annotations.append(eraser);
     check("eraser alpha", qAlpha(erased.render().pixel(30, 30)) == 0);
+    {
+        check("remaining tool serialization IDs stay compatible", int(Tool::Pen) == 7 &&
+              int(Tool::Mosaic) == 9 && int(Tool::Blur) == 10 && int(Tool::Eraser) == 11 &&
+              int(Tool::Text) == 12 && int(Tool::Number) == 13 && int(Tool::Magnify) == 14 &&
+              toolName(Tool(8)).isEmpty());
+        QImage image(100, 100, QImage::Format_RGB32);
+        image.fill(Qt::white);
+        const QColor blended(255, 255, 153);
+        for (int shape = 0; shape < 4; ++shape) {
+            QJsonObject legacy{{"tool", 8}, {"shape", shape}, {"color", "#66ffff00"},
+                {"width", 12}, {"lineStyle", int(Qt::DashLine)},
+                {"rect", QJsonArray{20, 20, 60, 40}}};
+            if (shape == 3) {
+                legacy["rect"] = QJsonArray{20, 50, 60, 0};
+                legacy["points"] = QJsonArray{QJsonArray{20, 50}, QJsonArray{80, 50}};
+            }
+            const auto item = Annotation::fromJson(legacy);
+            const Tool expected = shape == 3 ? Tool::Pen : shape == 0 ? Tool::Rectangle : Tool::Ellipse;
+            const QString suffix = QString::number(shape);
+            check("legacy marker converts to an ordinary tool " + suffix,
+                  item.tool == expected && item.toJson()["tool"].toInt() != 8 &&
+                  (shape == 3 ? item.color.alpha() == 102 && item.lineStyle == int(Qt::SolidLine)
+                              : item.color.alpha() == 0 && item.fill == QColor("#66ffff00")));
+            Document converted;
+            converted.image = image;
+            converted.annotations = {item};
+            const QImage rendered = converted.render();
+            check("legacy marker retains visible color and alpha " + suffix,
+                  rendered.pixelColor(shape == 3 ? QPoint(50, 50) : QPoint(40, 40)) == blended &&
+                  rendered.pixelColor(10, 10) == Qt::white);
+            check("converted marker round trip " + suffix,
+                  Document::fromJson(converted.toJson(), image).render() == rendered);
+        }
+        QJsonObject circle{{"tool", 8}, {"shape", 2}, {"color", "#66ffff00"},
+                           {"rotation", 90}, {"rect", QJsonArray{20, 20, 60, 40}}};
+        const auto rotated = Annotation::fromJson(circle);
+        check("legacy circle retains its rotated position", rotated.tool == Tool::Ellipse &&
+              rotated.rect == QRectF(30, 10, 40, 40) && rotated.rotation == 90);
+        Document circleDocument;
+        circleDocument.image = image;
+        circleDocument.annotations = {rotated};
+        check("legacy rotated circle remains visible in the correct region",
+              circleDocument.render().pixelColor(50, 30) == blended && circleDocument.render().pixelColor(25, 40) == Qt::white);
+        QJsonObject dot{{"tool", 8}, {"shape", 3}, {"color", "#66ffff00"}, {"width", 12},
+                        {"rect", QJsonArray{50, 50, 1, 1}}, {"points", QJsonArray{QJsonArray{50, 50}}}};
+        Document dotDocument;
+        dotDocument.image = image;
+        dotDocument.annotations = {Annotation::fromJson(dot)};
+        check("legacy single point marker remains visible", dotDocument.render().pixelColor(50, 50) == blended);
+    }
     QImage impulse(31, 31, QImage::Format_ARGB32);
     impulse.fill(Qt::black);
     impulse.setPixelColor(15, 15, Qt::white);
@@ -201,6 +251,8 @@ int runSelfTests(const QString &directory, bool native) {
     check("history pruning persists", afterPrune.records().isEmpty());
     settings.set("history/limit", 100);
     AnnotationCanvas canvas(sampleDocument(), settings);
+    check("canvas defaults to selection mode", canvas.tool() == Tool::Select);
+    canvas.setTool(Tool::Rectangle);
     canvas.setAttribute(Qt::WA_DontShowOnScreen);
     canvas.show();
     canvas.setZoom(1);
@@ -226,6 +278,7 @@ int runSelfTests(const QString &directory, bool native) {
     Document matching = sampleDocument();
     matching.detectedElements = {QRect(40, 40, 100, 70)};
     AnnotationCanvas matchingCanvas(matching, settings);
+    matchingCanvas.setTool(Tool::Rectangle);
     matchingCanvas.setAttribute(Qt::WA_DontShowOnScreen);
     matchingCanvas.show();
     QTest::mouseClick(&matchingCanvas, Qt::LeftButton, Qt::ControlModifier, QPoint(60, 60));
@@ -256,6 +309,7 @@ int runSelfTests(const QString &directory, bool native) {
             QTest::mouseRelease(widget, Qt::LeftButton, modifiers, to);
         };
         AnnotationCanvas editCanvas(sampleDocument(), settings);
+        editCanvas.setTool(Tool::Rectangle);
         editCanvas.setAttribute(Qt::WA_DontShowOnScreen);
         editCanvas.show();
         drag(&editCanvas, {100, 100}, {220, 180});
@@ -286,6 +340,74 @@ int runSelfTests(const QString &directory, bool native) {
               editCanvas.document().annotations.first().tool == Tool::Arrow);
         QTest::keyClick(&editCanvas, Qt::Key_Tab);
         check("Tab switches back to line", editCanvas.tool() == Tool::Line);
+        for (Tool tool : {Tool::Line, Tool::Arrow}) {
+            const QString label = tool == Tool::Line ? "line" : "arrow";
+            editCanvas.setDocument(sampleDocument());
+            editCanvas.setTool(tool);
+            drag(&editCanvas, {250, 100}, {100, 220});
+            const QImage selected = editCanvas.grab().toImage();
+            const QColor handle("#54d6b0");
+            check(label + " shows only endpoint handles",
+                  selected.pixelColor(250, 100) == handle && selected.pixelColor(100, 220) == handle &&
+                  selected.pixelColor(100, 100) != handle && selected.pixelColor(250, 220) != handle);
+            selected.save(QDir(directory).filePath(label + "-endpoints.png"));
+            drag(&editCanvas, {250, 100}, {300, 260});
+            check(label + " start endpoint crosses opposite endpoint",
+                  editCanvas.document().annotations.first().points == QVector<QPointF>{{300, 260}, {100, 220}});
+            drag(&editCanvas, {100, 220}, {80, 60});
+            check(label + " end endpoint moves independently",
+                  editCanvas.document().annotations.first().points == QVector<QPointF>{{300, 260}, {80, 60}} &&
+                  editCanvas.document().annotations.first().rect == QRectF(80, 60, 220, 200));
+            editCanvas.undo();
+            check(label + " endpoint undo restores both points",
+                  editCanvas.document().annotations.first().points == QVector<QPointF>{{300, 260}, {100, 220}});
+            editCanvas.redo();
+            check(label + " endpoint redo restores selection",
+                  editCanvas.selectedIndex() == 0 && editCanvas.tool() == tool &&
+                  editCanvas.document().annotations.first().points == QVector<QPointF>{{300, 260}, {80, 60}});
+            drag(&editCanvas, {190, 160}, {200, 180});
+            check(label + " body drag translates both endpoints",
+                  editCanvas.document().annotations.first().points == QVector<QPointF>{{310, 280}, {90, 80}});
+
+            Document axisDocument = sampleDocument();
+            Annotation axisLine;
+            axisLine.tool = tool;
+            axisLine.points = {{100, 100}, {220, 100}};
+            axisLine.rect = QRectF(100, 100, 120, 0);
+            axisDocument.annotations = {axisLine};
+            editCanvas.setDocument(axisDocument);
+            editCanvas.setTool(tool);
+            QTest::mouseClick(&editCanvas, Qt::LeftButton, {}, {160, 100});
+            drag(&editCanvas, {220, 100}, {100, 220});
+            check(label + " horizontal line becomes vertical through endpoint drag",
+                  editCanvas.document().annotations.first().points == QVector<QPointF>{{100, 100}, {100, 220}});
+            drag(&editCanvas, {100, 100}, {250, 220});
+            check(label + " vertical line becomes horizontal through start drag",
+                  editCanvas.document().annotations.first().points == QVector<QPointF>{{250, 220}, {100, 220}});
+            drag(&editCanvas, {100, 220}, {70, 190}, Qt::ShiftModifier);
+            const auto constrained = editCanvas.document().annotations.first().points;
+            check(label + " Shift constrains endpoint relative to the fixed point",
+                  constrained.first() == QPointF(250, 220) && qAbs(constrained.last().y() - 220) < 0.01);
+
+            editCanvas.setDocument(axisDocument);
+            editCanvas.setTool(Tool::Select);
+            editCanvas.setZoom(0.5);
+            QTest::mouseClick(&editCanvas, Qt::LeftButton, {}, {80, 50});
+            drag(&editCanvas, {110, 50}, {160, 110});
+            check(label + " endpoint editing respects canvas zoom in selection mode",
+                  editCanvas.document().annotations.first().points == QVector<QPointF>{{100, 100}, {320, 220}});
+            editCanvas.setZoom(1);
+
+            axisDocument.annotations[0].rotation = 90;
+            editCanvas.setDocument(axisDocument);
+            editCanvas.setTool(tool);
+            QTest::mouseClick(&editCanvas, Qt::LeftButton, {}, {160, 100});
+            drag(&editCanvas, {160, 160}, {220, 180});
+            const auto rotated = editCanvas.document().annotations.first();
+            check(label + " endpoint edit preserves rotated opposite point",
+                  QLineF(rotated.points.first(), QPointF(160, 40)).length() < 0.01 &&
+                  rotated.points.last() == QPointF(220, 180) && rotated.rotation == 0);
+        }
         editCanvas.setDocument(sampleDocument());
         editCanvas.setTool(Tool::Polyline);
         QTest::mouseClick(&editCanvas, Qt::LeftButton, {}, {100, 100});
@@ -296,6 +418,10 @@ int runSelfTests(const QString &directory, bool native) {
         QTest::mouseClick(&editCanvas, Qt::RightButton, {}, {300, 120});
         check("polyline ends at last committed vertex", !editCanvas.drawing() &&
               editCanvas.document().annotations.first().points == QVector<QPointF>{{100, 100}, {200, 100}, {250, 150}});
+        QTest::mouseClick(&editCanvas, Qt::LeftButton, {}, {200, 100});
+        drag(&editCanvas, {200, 100}, {210, 130});
+        check("polyline vertex edit preserves every other vertex",
+              editCanvas.document().annotations.first().points == QVector<QPointF>{{100, 100}, {210, 130}, {250, 150}});
         editCanvas.setDocument(matching);
         editCanvas.setTool(Tool::Ellipse);
         QTest::mouseClick(&editCanvas, Qt::RightButton, {}, {60, 60});
@@ -338,16 +464,17 @@ int runSelfTests(const QString &directory, bool native) {
               editCanvas.document().annotations.first().fontSize > 24);
 
         editCanvas.setDocument(sampleDocument());
-        editCanvas.setTool(Tool::Highlighter);
+        editCanvas.setTool(Tool::Pen);
         auto brushStyle = editCanvas.style();
         brushStyle.shape = 3;
         brushStyle.width = 20;
+        brushStyle.color.setAlpha(100);
         editCanvas.setStyle(brushStyle);
         drag(&editCanvas, {100, 300}, {200, 330}, Qt::ShiftModifier);
         const Annotation stroke = editCanvas.document().annotations.first();
-        check("marker brush direction constraint", stroke.points.size() >= 2 &&
-              qAbs(stroke.points.last().y() - stroke.points.first().y()) < 0.01);
-        for (Tool effect : {Tool::Highlighter, Tool::Mosaic, Tool::Blur, Tool::Eraser}) {
+        check("transparent pen direction constraint", stroke.tool == Tool::Pen && stroke.color.alpha() == 100 &&
+              stroke.points.size() >= 2 && qAbs(stroke.points.last().y() - stroke.points.first().y()) < 0.01);
+        for (Tool effect : {Tool::Mosaic, Tool::Blur, Tool::Eraser}) {
             Document effectDocument;
             effectDocument.image = QImage(100, 100, QImage::Format_ARGB32);
             effectDocument.image.fill(Qt::white);
@@ -384,6 +511,103 @@ int runSelfTests(const QString &directory, bool native) {
         QTest::mouseClick(palette.viewport(), Qt::LeftButton, {}, palette.visualItemRect(palette.item(2)).center());
         check("palette retains alpha channel", editCanvas.style().color.alpha() == 128);
         editCanvas.hide();
+    }
+    {
+        Settings editSettings(temporary.path() + "/editable-annotations");
+        AnnotationCanvas editable(sampleDocument(), editSettings);
+        editable.setAttribute(Qt::WA_DontShowOnScreen);
+        editable.show();
+        auto drag = [&](const QPoint &from, const QPoint &to) {
+            QTest::mousePress(&editable, Qt::LeftButton, {}, from);
+            QMouseEvent move(QEvent::MouseMove, QPointF(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(&editable, &move);
+            QTest::mouseRelease(&editable, Qt::LeftButton, {}, to);
+        };
+        for (Tool tool : {Tool::Line, Tool::Arrow, Tool::Rectangle, Tool::Ellipse, Tool::Pen}) {
+            editable.setDocument(sampleDocument());
+            editable.setTool(tool);
+            drag({100, 100}, {220, 160});
+            check("new annotation stays active after drawing " + toolKey(tool),
+                  editable.selectedIndex() == 0 && !editable.drawing());
+            editable.setTool(tool == Tool::Pen ? Tool::Arrow : Tool::Pen);
+            QTest::mouseClick(&editable, Qt::LeftButton, {}, tool == Tool::Rectangle ? QPoint(100, 130) :
+                              tool == Tool::Ellipse ? QPoint(160, 100) : QPoint(160, 130));
+            check("another drawing tool can activate existing annotation " + toolKey(tool),
+                  editable.selectedIndex() == 0 && editable.document().annotations.size() == 1);
+        }
+        Document saved = sampleDocument();
+        Annotation line;
+        line.tool = Tool::Arrow;
+        line.rect = QRectF(100, 100, 120, 0);
+        line.points = {{100, 100}, {220, 100}};
+        line.color = QColor("#ff536b");
+        line.width = 8;
+        saved.annotations = {line};
+        editable.setDocument(saved);
+        editable.setTool(Tool::Pen);
+        QTest::mouseClick(&editable, Qt::LeftButton, {}, {195, 115});
+        check("arrow head can activate the existing arrow", editable.selectedIndex() == 0 &&
+              editable.document().annotations.size() == 1);
+        check("selecting without moving creates no undo entry", !editable.canUndo());
+        editable.setStyle(editable.style());
+        check("unchanged style creates no undo entry", !editable.canUndo());
+        auto changed = editable.style();
+        changed.color = QColor("#58a6ff");
+        changed.width = 14;
+        editable.setStyle(changed);
+        check("style edit changes selected annotation pixels", editable.document().render().pixelColor(160, 100) ==
+              changed.color && editable.document().annotations.first().width == 14);
+        editable.undo();
+        check("style undo restores the original selected object", editable.document().annotations.first().toJson() == line.toJson());
+        editable.redo();
+        check("style redo reactivates the edited object and preserves the drawing tool", editable.selectedIndex() == 0 &&
+              editable.style().width == 14 && editable.tool() == Tool::Pen);
+        editSettings.set("annotation/selectNew", false);
+        editable.setDocument(saved);
+        editable.setTool(Tool::Rectangle);
+        QTest::mouseClick(&editable, Qt::LeftButton, {}, {160, 100});
+        check("manual selection remains active when auto selection is disabled", editable.selectedIndex() == 0);
+        drag({220, 100}, {260, 180});
+        check("endpoint remains editable when auto selection is disabled", editable.selectedIndex() == 0 &&
+              editable.document().annotations.first().points == QVector<QPointF>{{100, 100}, {260, 180}});
+        QTest::mouseClick(&editable, Qt::RightButton, {}, {400, 300});
+        drag({320, 240}, {420, 300});
+        check("auto selection preference still applies to new annotations", editable.selectedIndex() == -1 &&
+              editable.document().annotations.size() == 2);
+        editSettings.set("annotation/selectNew", true);
+        Document outline = sampleDocument();
+        Annotation box;
+        box.tool = Tool::Rectangle;
+        box.rect = QRectF(60, 60, 300, 200);
+        outline.annotations = {box};
+        editable.setDocument(outline);
+        editable.setTool(Tool::Arrow);
+        drag({120, 140}, {260, 160});
+        check("drawing can start inside an unselected unfilled shape", editable.document().annotations.size() == 2 &&
+              editable.document().annotations.last().tool == Tool::Arrow);
+        for (Tool tool : {Tool::Text, Tool::Number}) {
+            Document labeled = sampleDocument();
+            Annotation label;
+            label.tool = tool;
+            label.rect = QRectF(200, 180, 120, 60);
+            label.fontSize = 24;
+            label.text = "Editable";
+            labeled.annotations = {label};
+            editable.setDocument(labeled);
+            editable.setTool(Tool::Select);
+            QTest::mouseClick(&editable, Qt::LeftButton, {}, {250, 210});
+            auto next = editable.style();
+            next.fontSize = 48;
+            editable.setStyle(next);
+            check("font property resizes the selected label " + toolKey(tool),
+                  editable.style().rect.size() == QSizeF(240, 120) &&
+                  (tool == Tool::Text ? editable.style().rect.topLeft() == label.rect.topLeft()
+                                      : editable.style().rect.center() == label.rect.center()));
+            editable.undo();
+            check("font property undo restores label geometry " + toolKey(tool),
+                  editable.document().annotations.first().toJson() == label.toJson());
+        }
+        editable.hide();
     }
     Native::Desktop desktop;
     desktop.image = sampleDocument().image;
@@ -584,6 +808,8 @@ int runSelfTests(const QString &directory, bool native) {
         QObject::connect(&inlineOverlay, &CaptureOverlay::canceled, &inlineOverlay,
                          [&](const Document &) { ++cancellations; });
         auto *toolbar = inlineOverlay.findChild<QWidget *>("captureEditorToolbar");
+        check("capture has no retired highlighter tool", !inlineOverlay.findChild<QAction *>("captureTool8"));
+        check("capture toolbar has no region adjustment action", !inlineOverlay.findChild<QAction *>("adjustCaptureRegion"));
         check("capture toolbar has no pin output", !inlineOverlay.findChild<QAction *>("captureOutput-pin"));
         check("capture tools hidden before selection", toolbar && !toolbar->isVisible());
         QTest::mousePress(&inlineOverlay, Qt::LeftButton, {}, QPoint(90, 110));
@@ -598,11 +824,53 @@ int runSelfTests(const QString &directory, bool native) {
         check("inline canvas matches physical capture pixels",
               inlineCanvas && inlineCanvas->geometry() == QRect(90, 110, 561, 251) &&
                   inlineCanvas->document().image == desktop.image.copy(90, 110, 561, 251));
+        check("capture defaults to interactive selection without a selection button",
+              inlineCanvas && inlineCanvas->tool() == Tool::Select && inlineCanvas->isVisible() &&
+              !inlineCanvas->testAttribute(Qt::WA_TransparentForMouseEvents) &&
+              !inlineOverlay.findChild<QAction *>("captureTool0"));
         QToolButton *rectangleButton = nullptr;
         for (auto *button : inlineOverlay.findChildren<QToolButton *>())
             if (button->defaultAction() && button->defaultAction()->objectName() == "captureTool1")
                 rectangleButton = button;
         check("rectangle tool is directly available", rectangleButton && rectangleButton->isVisible());
+        auto *lineButton = inlineOverlay.findChild<QToolButton *>("captureLineToolButton");
+        auto *lineAction = inlineOverlay.findChild<QAction *>("captureTool" + toolKey(Tool::Line));
+        auto *arrowAction = inlineOverlay.findChild<QAction *>("captureTool" + toolKey(Tool::Arrow));
+        auto *toolVariant = inlineOverlay.findChild<QComboBox *>("captureToolVariant");
+        check("inline line primary button has no secondary menu",
+              lineButton && !lineButton->menu() && lineAction && arrowAction);
+        bool polylineDirect = false;
+        for (auto *button : inlineOverlay.findChildren<QToolButton *>())
+            if (button->defaultAction() && button->defaultAction()->objectName() == "captureTool" + toolKey(Tool::Polyline))
+                polylineDirect = !button->menu();
+        check("inline polyline remains separately available", polylineDirect);
+        if (inlineCanvas && lineButton && lineAction && arrowAction) {
+            lineAction->trigger();
+            check("inline secondary line menu contains exactly line and arrow styles",
+                  toolVariant && toolVariant->isVisible() && toolVariant->count() == 2 &&
+                  toolVariant->findData(int(Tool::Line)) >= 0 && toolVariant->findData(int(Tool::Arrow)) >= 0);
+            check("inline line style updates the shared button",
+                  inlineCanvas->tool() == Tool::Line && lineButton->defaultAction() == lineAction && lineAction->isChecked());
+            QTest::keyClick(inlineCanvas, Qt::Key_Tab);
+            check("inline Tab switch updates the shared button",
+                  inlineCanvas->tool() == Tool::Arrow && lineButton->defaultAction() == arrowAction && arrowAction->isChecked());
+            QTest::mousePress(inlineCanvas, Qt::LeftButton, {}, {60, 200});
+            QMouseEvent arrowDrag(QEvent::MouseMove, QPointF(300, 60), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(inlineCanvas, &arrowDrag);
+            QTest::mouseRelease(inlineCanvas, Qt::LeftButton, {}, {300, 60});
+            check("inline arrow uses the chosen two-point style",
+                  inlineCanvas->document().annotations.size() == 1 &&
+                  inlineCanvas->document().annotations.first().tool == Tool::Arrow &&
+                  inlineCanvas->document().annotations.first().points == QVector<QPointF>{{60, 200}, {300, 60}});
+            inlineOverlay.grab().save(QDir(directory).filePath("capture-line-endpoints.png"));
+            inlineOverlay.findChild<QWidget *>("captureToolOptions")->grab().save(
+                QDir(directory).filePath("line-style-options.png"));
+            inlineCanvas->undo();
+            lineAction->trigger();
+            inlineOverlay.findChild<QAction *>("captureTool1")->trigger();
+            lineButton->click();
+            check("inline line button remembers the chosen style", inlineCanvas->tool() == Tool::Line);
+        }
         if (inlineCanvas && rectangleButton) {
             rectangleButton->click();
             check("inline tool activates canvas input", inlineCanvas->tool() == Tool::Rectangle &&
@@ -635,7 +903,7 @@ int runSelfTests(const QString &directory, bool native) {
             QTest::mouseClick(inlineCanvas, Qt::RightButton);
             check("right click finishes annotation editing", inlineCanvas->selectedIndex() == -1 &&
                   !inlineCanvas->testAttribute(Qt::WA_TransparentForMouseEvents));
-            inlineOverlay.findChild<QAction *>("adjustCaptureRegion")->trigger();
+            rectangleButton->click();
             QTest::keyClick(&inlineOverlay, Qt::Key_Right);
             QTest::keyClicks(&inlineOverlay, "600x300");
             QTest::keyClick(&inlineOverlay, Qt::Key_Return);
@@ -683,6 +951,480 @@ int runSelfTests(const QString &directory, bool native) {
         check("escape cancels inline editing once with annotations",
               cancellations == 1 && abandoned.annotations.size() == 1 && !canceledOverlay.isVisible());
     }
+    {
+        CaptureOverlay contextual(desktop, settings, QRect(-780, 90, 600, 210));
+        contextual.setAttribute(Qt::WA_DeleteOnClose, false);
+        contextual.setAttribute(Qt::WA_DontShowOnScreen);
+        contextual.show();
+        QCoreApplication::processEvents();
+        auto *primary = contextual.findChild<QWidget *>("captureEditorToolbar");
+        auto *options = contextual.findChild<QWidget *>("captureToolOptions");
+        auto *canvas = contextual.findChild<AnnotationCanvas *>();
+        auto *variant = contextual.findChild<QComboBox *>("captureToolVariant");
+        auto *effectShape = contextual.findChild<QComboBox *>("captureEffectShape");
+        auto *color = contextual.findChild<QPushButton *>("annotationColor");
+        auto *font = contextual.findChild<ValueSlider *>("captureFontSize");
+        auto *width = contextual.findChild<ValueSlider *>("captureStrokeWidth");
+        auto *opacity = contextual.findChild<ValueSlider *>("captureOpacity");
+        auto *colors = contextual.findChild<QWidget *>("captureColorPresets");
+        auto *tips = contextual.findChild<QWidget *>("captureBrushTips");
+        const QRect primaryGeometry = primary->geometry();
+        check("capture initially shows only primary tools", primary->isVisible() && !options->isVisible());
+        check("secondary options float separately from primary tools", options->parentWidget() == &contextual);
+        bool iconsOnly = true;
+        QToolButton *shapeButton = nullptr;
+        for (auto *button : primary->findChildren<QToolButton *>())
+            if (button->property("captureToolGroup").isValid()) {
+                iconsOnly = iconsOnly && !button->menu() && button->toolButtonStyle() == Qt::ToolButtonIconOnly;
+                if (button->property("captureToolGroup").toList().contains(int(Tool::Rectangle)))
+                    shapeButton = button;
+            }
+        check("primary annotation tools are icons without option menus", iconsOnly && shapeButton);
+        contextual.grab().save(QDir(directory).filePath("capture-primary-only.png"));
+        contextual.findChild<QAction *>("captureTool" + toolKey(Tool::Rectangle))->trigger();
+        check("activating shape tool reveals its secondary options",
+              options->isVisible() && variant->isVisible() && variant->count() == 3 &&
+              color->isVisible() && colors->isVisible() && width->isVisible() && !font->isVisible() && !effectShape->isVisible());
+        check("secondary options do not move the primary toolbar", primary->geometry() == primaryGeometry);
+        check("secondary options fit screen without covering primary tools",
+              contextual.rect().contains(options->geometry()) && !primary->geometry().intersects(options->geometry()));
+        check("capture strength controls use sliders", width && font && opacity &&
+              options->findChildren<QAbstractSpinBox *>().isEmpty());
+        width->setValue(12.5);
+        check("stroke slider updates fractional width", qAbs(canvas->style().width - 12.5) < 0.01);
+        opacity->setValue(50);
+        check("opacity slider updates alpha", canvas->style().color.alpha() == 128);
+        opacity->setValue(0);
+        check("opacity slider reaches transparent endpoint", canvas->style().color.alpha() == 0);
+        opacity->setValue(100);
+        check("opacity slider reaches opaque endpoint", canvas->style().color.alpha() == 255);
+        const int ellipseIndex = variant->findData(int(Tool::Ellipse));
+        variant->setCurrentIndex(ellipseIndex);
+        QMetaObject::invokeMethod(variant, "activated", Qt::DirectConnection, Q_ARG(int, ellipseIndex));
+        check("secondary shape selection updates primary icon and drawing tool",
+              canvas->tool() == Tool::Ellipse && shapeButton->defaultAction()->data().toInt() == int(Tool::Ellipse));
+        shapeButton->click();
+        check("clicking active primary tool collapses secondary options",
+              !options->isVisible() && canvas->tool() == Tool::Select && primary->geometry() == primaryGeometry);
+        shapeButton->click();
+        check("reactivating primary tool restores chosen shape",
+              options->isVisible() && canvas->tool() == Tool::Ellipse && variant->currentData().toInt() == int(Tool::Ellipse));
+        contextual.findChild<QAction *>("captureTool" + toolKey(Tool::Text))->trigger();
+        check("text secondary options show font instead of stroke width",
+              options->isVisible() && font->isVisible() && !width->isVisible() && color->isVisible() &&
+              variant->count() == 2 && !effectShape->isVisible());
+        font->setValue(48);
+        check("font slider updates text size", canvas->style().fontSize == 48);
+        contextual.findChild<QAction *>("captureTool" + toolKey(Tool::Mosaic))->trigger();
+        check("mosaic secondary options show effect shapes without color palette",
+              options->isVisible() && effectShape->isVisible() && !color->isVisible() && !colors->isVisible() &&
+              !font->isVisible() && width->isVisible());
+        effectShape->setCurrentIndex(3);
+        QMetaObject::invokeMethod(effectShape, "activated", Qt::DirectConnection, Q_ARG(int, 3));
+        check("effect shape option changes brush mode", canvas->style().shape == 3 && tips->isVisible());
+        contextual.findChild<QAction *>("captureTool" + toolKey(Tool::Magnify))->trigger();
+        check("magnify secondary options omit color font and stroke controls",
+              options->isVisible() && !color->isVisible() && !font->isVisible() && !width->isVisible() && !colors->isVisible());
+        contextual.findChild<QAction *>("captureTool" + toolKey(Tool::Magnify))->trigger();
+        check("closing magnify restores default selection and hides options",
+              canvas->tool() == Tool::Select && !options->isVisible());
+        contextual.findChild<QAction *>("captureTool" + toolKey(Tool::Rectangle))->trigger();
+        contextual.setHistory(1, [](int) { return sampleDocument(); });
+        QTest::keyClick(&contextual, Qt::Key_Comma);
+        check("history opens with only primary tools", !options->isVisible());
+        check("history preview does not expose live capture resize border",
+              !contextual.findChild<QWidget *>("captureResizeBorder")->isVisible());
+        QTest::keyClick(&contextual, Qt::Key_Period);
+        check("returning from history restores active secondary options", options->isVisible() &&
+              contextual.findChild<AnnotationCanvas *>()->tool() == Tool::Rectangle);
+        contextual.grab().save(QDir(directory).filePath("capture-secondary-shapes.png"));
+        shapeButton->click();
+        check("deactivating shape tool collapses secondary options", !options->isVisible());
+        QTest::mouseClick(&contextual, Qt::RightButton, {}, {400, 250});
+        check("clearing capture selection hides both tool levels", !primary->isVisible() && !options->isVisible());
+        contextual.hide();
+    }
+    {
+        Settings activeSettings(temporary.path() + "/active-style-toolbar");
+        activeSettings.set("magnifier/enabled", false);
+        activeSettings.set("annotation/palette", QStringList{"#ff536b", "#58a6ff"});
+        CaptureOverlay active(desktop, activeSettings, QRect(-800, 60, 640, 320));
+        active.setAttribute(Qt::WA_DeleteOnClose, false);
+        active.setAttribute(Qt::WA_DontShowOnScreen);
+        active.show();
+        auto *canvas = active.findChild<AnnotationCanvas *>();
+        auto *options = active.findChild<QWidget *>("captureToolOptions");
+        auto *width = active.findChild<ValueSlider *>("captureStrokeWidth");
+        auto *opacity = active.findChild<ValueSlider *>("captureOpacity");
+        auto *variant = active.findChild<QComboBox *>("captureToolVariant");
+        auto drag = [&](const QPoint &from, const QPoint &to) {
+            QTest::mousePress(canvas, Qt::LeftButton, {}, from);
+            QMouseEvent move(QEvent::MouseMove, QPointF(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(canvas, &move);
+            QTest::mouseRelease(canvas, Qt::LeftButton, {}, to);
+        };
+        active.findChild<QAction *>("captureTool" + toolKey(Tool::Arrow))->trigger();
+        width->setValue(4);
+        const Annotation defaults = canvas->style();
+        check("toolbar edits drawing defaults without an active object", canvas->selectedIndex() == -1 &&
+              options->isVisible() && width->value() == defaults.width);
+        drag({70, 90}, {250, 90});
+        check("drawn arrow activates toolbar editing", canvas->selectedIndex() == 0 && options->isVisible());
+        drag({250, 90}, {290, 150});
+        drag({180, 120}, {200, 140});
+        check("active arrow supports endpoint and position editing", canvas->document().annotations.size() == 1 &&
+              canvas->document().annotations.first().points == QVector<QPointF>{{90, 110}, {310, 170}});
+        width->slider()->setSliderDown(true);
+        width->setValue(8);
+        width->setValue(12);
+        width->slider()->setSliderDown(false);
+        check("capture slider changes active arrow width", canvas->style().width == 12);
+        canvas->undo();
+        check("capture slider drag undoes as one edit", canvas->document().annotations.first().width == 4);
+        canvas->redo();
+        check("capture slider redo restores selection and inspector", canvas->selectedIndex() == 0 && width->value() == 12);
+        auto *palette = active.findChild<QListWidget *>("annotationPalette");
+        QTest::mouseClick(palette->viewport(), Qt::LeftButton, {}, palette->visualItemRect(palette->item(1)).center());
+        opacity->setValue(50);
+        check("palette and opacity edit the active arrow", canvas->style().color == QColor(88, 166, 255, 128) &&
+              canvas->document().annotations.size() == 1);
+        const int line = variant->findData(int(Tool::Line));
+        QMetaObject::invokeMethod(variant, "activated", Qt::DirectConnection, Q_ARG(int, line));
+        check("secondary variant edits active object without resetting its geometry", canvas->selectedIndex() == 0 &&
+              canvas->style().tool == Tool::Line && canvas->tool() == Tool::Arrow &&
+              canvas->style().points == QVector<QPointF>{{90, 110}, {310, 170}});
+        active.grab().save(QDir(directory).filePath("capture-active-annotation.png"));
+        QTest::mouseClick(canvas, Qt::RightButton, {}, {450, 220});
+        check("ending object editing restores drawing defaults", canvas->selectedIndex() == -1 &&
+              options->isVisible() && width->value() == defaults.width &&
+              canvas->style().color == defaults.color && canvas->style().tool == Tool::Arrow);
+        width->setValue(7);
+        opacity->setValue(80);
+        check("unselected toolbar changes preserve existing objects", canvas->document().annotations.first().width == 12 &&
+              canvas->document().annotations.first().color == QColor(88, 166, 255, 128));
+        drag({400, 220}, {520, 260});
+        check("unselected toolbar changes apply to the next operation", canvas->document().annotations.size() == 2 &&
+              canvas->style().width == 7 && canvas->style().color.alpha() == 204 && canvas->style().tool == Tool::Arrow);
+        active.findChild<QAction *>("captureTool" + toolKey(Tool::Rectangle))->trigger();
+        const Annotation shapeDefaults = canvas->style();
+        QTest::mouseClick(canvas, Qt::LeftButton, {}, {200, 140});
+        check("other drawing tool reactivates existing line with matching inspector", canvas->tool() == Tool::Rectangle &&
+              canvas->selectedIndex() == 0 && width->value() == 12 && variant->currentData().toInt() == int(Tool::Line));
+        width->setValue(16);
+        QTest::mouseClick(canvas, Qt::RightButton, {}, {450, 220});
+        check("editing another tool's object preserves current tool defaults", canvas->tool() == Tool::Rectangle &&
+              canvas->selectedIndex() == -1 && canvas->style().width == shapeDefaults.width &&
+              canvas->style().color == shapeDefaults.color);
+        active.findChild<QAction *>("captureTool" + toolKey(Tool::Rectangle))->trigger();
+        QTest::mouseClick(canvas, Qt::LeftButton, {}, {200, 140});
+        check("default selection exposes active object properties", canvas->tool() == Tool::Select &&
+              canvas->selectedIndex() == 0 && options->isVisible());
+        width->setValue(18);
+        check("default selection toolbar edits the selected object", canvas->document().annotations.first().width == 18);
+        QTest::mouseClick(canvas, Qt::LeftButton, {}, {550, 200});
+        check("blank click clears the active object inspector", canvas->selectedIndex() == -1 && !options->isVisible());
+        active.hide();
+    }
+    {
+        CaptureOverlay neutral(desktop, settings, QRect(-780, 90, 600, 210));
+        neutral.setAttribute(Qt::WA_DeleteOnClose, false);
+        neutral.setAttribute(Qt::WA_DontShowOnScreen);
+        neutral.show();
+        auto *canvas = neutral.findChild<AnnotationCanvas *>();
+        auto *options = neutral.findChild<QWidget *>("captureToolOptions");
+        auto inactive = [&] {
+            for (auto *action : neutral.findChildren<QAction *>())
+                if (action->objectName().startsWith("captureTool") && action->isCheckable() && action->isChecked())
+                    return false;
+            return true;
+        };
+        check("default selection leaves every primary tool inactive", inactive() && canvas->tool() == Tool::Select);
+        Document marked = canvas->document();
+        Annotation mark;
+        mark.tool = Tool::Rectangle;
+        mark.rect = QRectF(70, 60, 100, 70);
+        marked.annotations = {mark};
+        canvas->setDocument(marked);
+        const QRect region = neutral.selectedGlobal();
+        QTest::mousePress(canvas, Qt::LeftButton, {}, {100, 90});
+        QMouseEvent move(QEvent::MouseMove, QPointF(120, 100), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &move);
+        QTest::mouseRelease(canvas, Qt::LeftButton, {}, {120, 100});
+        check("default selection directly moves existing annotations",
+              canvas->document().annotations.size() == 1 && canvas->selectedIndex() == 0 &&
+              canvas->document().annotations.first().rect == QRectF(90, 70, 100, 70) &&
+              neutral.selectedGlobal() == region && canvas->tool() == Tool::Select);
+        check("selecting an annotation shows its options without activating a primary tool", inactive() && options->isVisible());
+        canvas->undo();
+        canvas->redo();
+        check("redo preserves default selection mode",
+              canvas->tool() == Tool::Select && canvas->selectedIndex() == 0 && inactive() && options->isVisible());
+        canvas->copyObject();
+        QTest::keyClick(canvas, Qt::Key_Delete);
+        check("default selection deletes existing annotations", canvas->document().annotations.isEmpty());
+        QTest::keyClick(&neutral, Qt::Key_V, Qt::ControlModifier | Qt::ShiftModifier);
+        if (canvas->document().annotations.size() != 1 || canvas->tool() != Tool::Select || !inactive() || !options->isVisible())
+            QTextStream(stdout) << "Neutral annotation paste state: count=" << canvas->document().annotations.size()
+                                << " selected=" << canvas->selectedIndex() << " tool=" << int(canvas->tool())
+                                << " inactive=" << inactive() << " options=" << options->isVisible()
+                                << " capture=" << neutral.isVisible() << " clipboard="
+                                << QApplication::clipboard()->mimeData()->formats().join(',') << '\n';
+        check("annotation paste needs no selection toolbar action",
+              canvas->document().annotations.size() == 1 && canvas->tool() == Tool::Select && inactive() && options->isVisible());
+        QTest::keyClick(canvas, Qt::Key_Delete);
+        QTest::mousePress(canvas, Qt::LeftButton, {}, {250, 140});
+        QMouseEvent blankDrag(QEvent::MouseMove, QPointF(280, 160), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &blankDrag);
+        QTest::mouseRelease(canvas, Qt::LeftButton, {}, {280, 160});
+        check("blank selection drag moves capture without creating annotations", canvas->document().annotations.isEmpty() &&
+              neutral.selectedGlobal() == region.translated(30, 20) && inactive());
+        int outputs = 0;
+        QObject::connect(&neutral, &CaptureOverlay::outputRequested, &neutral, [&](Document, QRect, QString, bool) { ++outputs; });
+        QTest::keyClicks(canvas, "520x240");
+        QTest::keyClick(canvas, Qt::Key_Return);
+        check("default selection retains typed capture dimensions with canvas focus",
+              neutral.selectedGlobal().size() == QSize(520, 240) && outputs == 0 && canvas->tool() == Tool::Select);
+        for (auto *button : neutral.findChildren<QToolButton *>())
+            if (button->property("captureToolGroup").isValid()) {
+                const Tool tool = Tool(button->defaultAction()->data().toInt());
+                button->click();
+                check("primary tool activates from default selection " + toolKey(tool), canvas->tool() == tool &&
+                      button->isChecked() && options->isVisible());
+                button->click();
+                check("second primary click returns to default selection " + toolKey(tool),
+                      canvas->tool() == Tool::Select && inactive() && !options->isVisible() &&
+                      !canvas->testAttribute(Qt::WA_TransparentForMouseEvents) && canvas->cursor().shape() == Qt::ArrowCursor);
+            }
+        neutral.hide();
+    }
+    {
+        CaptureOverlay moving(desktop, settings, QRect(-780, 70, 420, 240));
+        moving.setAttribute(Qt::WA_DeleteOnClose, false);
+        moving.setAttribute(Qt::WA_DontShowOnScreen);
+        moving.show();
+        auto *canvas = moving.findChild<AnnotationCanvas *>();
+        auto *toolbar = moving.findChild<QWidget *>("captureEditorToolbar");
+        auto *options = moving.findChild<QWidget *>("captureToolOptions");
+        Document document = canvas->document();
+        Annotation mark;
+        mark.tool = Tool::Rectangle;
+        mark.rect = QRectF(80, 60, 100, 70);
+        document.annotations = {mark};
+        canvas->setDocument(document);
+        const QRect original = moving.selectedGlobal();
+        const QRect local = canvas->geometry();
+        auto sendMove = [](QWidget *widget, const QPoint &point) {
+            QMouseEvent move(QEvent::MouseMove, QPointF(point), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(widget, &move);
+        };
+        auto drag = [&](const QPoint &from, const QPoint &to) {
+            QTest::mousePress(canvas, Qt::LeftButton, {}, from);
+            sendMove(canvas, to);
+            QTest::mouseRelease(canvas, Qt::LeftButton, {}, to);
+        };
+        QTest::mouseClick(canvas, Qt::LeftButton, {}, {120, 90});
+        check("selection hit testing keeps annotation body and handles interactive",
+              !canvas->canStartBackgroundDrag({120, 90}) && !canvas->canStartBackgroundDrag({80, 60}) &&
+              !canvas->canStartBackgroundDrag({130, 33}) && canvas->canStartBackgroundDrag({300, 180}));
+        QTest::mousePress(canvas, Qt::LeftButton, {}, {300, 180});
+        check("blank press deselects annotation without moving capture or hiding toolbar",
+              canvas->selectedIndex() == -1 && moving.selectedGlobal() == original && toolbar->isVisible());
+        const QPoint small(qMax(0, QApplication::startDragDistance() - 1), 0);
+        sendMove(canvas, QPoint(300, 180) + small);
+        QTest::mouseRelease(canvas, Qt::LeftButton, {}, QPoint(300, 180) + small);
+        check("sub-threshold mouse motion does not move capture", moving.selectedGlobal() == original && toolbar->isVisible());
+        const QImage annotated = canvas->document().render();
+        QTest::mousePress(canvas, Qt::LeftButton, {}, {300, 180});
+        sendMove(canvas, {360, 215});
+        check("blank drag moves entire capture while keeping size",
+              moving.selectedGlobal() == original.translated(60, 35) && moving.selectedGlobal().size() == original.size());
+        check("capture drag hides controls until release", !toolbar->isVisible() && !options->isVisible());
+        const QImage preview = moving.grab().toImage();
+        check("capture drag preview moves annotations with the selection",
+              preview.pixelColor(local.topLeft() + QPoint(60, 35) + QPoint(100, 60)) == annotated.pixelColor(100, 60));
+        QTest::mouseRelease(&moving, Qt::LeftButton, {}, local.topLeft() + QPoint(360, 215));
+        const QRect translated = original.translated(60, 35);
+        check("capture drag release updates background and source coordinates",
+              toolbar->isVisible() && canvas->geometry() == translated.translated(-desktop.geometry.topLeft()) &&
+              canvas->document().sourceRect == translated &&
+              canvas->document().image == desktop.image.copy(translated.translated(-desktop.geometry.topLeft())));
+        check("capture movement preserves relative annotation geometry and selection mode",
+              canvas->document().annotations.first().toJson() == mark.toJson() && canvas->tool() == Tool::Select && !options->isVisible());
+        drag({300, 180}, {2200, 1800});
+        check("capture movement clamps to right and bottom desktop edges",
+              moving.selectedGlobal() == QRect(desktop.geometry.bottomRight() - QPoint(original.width() - 1, original.height() - 1), original.size()));
+        drag({300, 180}, {-1600, -1400});
+        check("capture movement clamps to left and top desktop edges",
+              moving.selectedGlobal() == QRect(desktop.geometry.topLeft(), original.size()));
+        const QRect clamped = moving.selectedGlobal();
+        drag({120, 90}, {140, 100});
+        check("dragging annotation in selection mode keeps capture fixed",
+              moving.selectedGlobal() == clamped && canvas->document().annotations.first().rect == QRectF(100, 70, 100, 70));
+        drag({100, 70}, {80, 30});
+        check("dragging selected annotation corner does not move capture",
+              moving.selectedGlobal() == clamped && canvas->document().annotations.first().rect == QRectF(80, 30, 120, 110));
+        canvas->undo();
+        check("moving capture creates no annotation undo entry",
+              canvas->document().annotations.first().rect == QRectF(100, 70, 100, 70));
+        canvas->undo();
+        check("annotation undo after capture movement restores original relative geometry",
+              canvas->document().annotations.first().toJson() == mark.toJson() && moving.selectedGlobal() == clamped);
+        moving.findChild<QAction *>("captureTool" + toolKey(Tool::Arrow))->trigger();
+        drag({300, 180}, {350, 205});
+        check("active drawing tool still annotates instead of moving capture",
+              moving.selectedGlobal() == clamped && canvas->document().annotations.size() == 2 &&
+              canvas->document().annotations.last().tool == Tool::Arrow);
+        moving.findChild<QAction *>("captureTool" + toolKey(Tool::Arrow))->trigger();
+        moving.setHistory(1, [](int) { return sampleDocument(); });
+        QTest::keyClick(&moving, Qt::Key_Comma);
+        canvas = moving.findChild<AnnotationCanvas *>();
+        const QRect historyGeometry = canvas->geometry();
+        drag({300, 180}, {340, 205});
+        check("history preview drag does not move live capture selection", canvas->geometry() == historyGeometry);
+        moving.hide();
+    }
+    {
+        CaptureOverlay penOverlay(desktop, settings, QRect(-780, 90, 400, 230));
+        penOverlay.setAttribute(Qt::WA_DontShowOnScreen);
+        penOverlay.show();
+        auto *pen = penOverlay.findChild<QAction *>("captureTool" + toolKey(Tool::Pen));
+        pen->trigger();
+        auto *canvas = penOverlay.findChild<AnnotationCanvas *>();
+        auto *opacity = penOverlay.findChild<ValueSlider *>("captureOpacity");
+        auto *width = penOverlay.findChild<ValueSlider *>("captureStrokeWidth");
+        check("pen exposes opacity without a separate marker tool", opacity->isVisible() && width->isVisible() &&
+              !penOverlay.findChild<QComboBox *>("captureEffectShape")->isVisible() && !penOverlay.findChild<QAction *>("captureTool8"));
+        opacity->setValue(40);
+        width->setValue(18);
+        QTest::mousePress(canvas, Qt::LeftButton, {}, {40, 80});
+        QMouseEvent draw(QEvent::MouseMove, QPointF(220, 80), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &draw);
+        QTest::mouseRelease(canvas, Qt::LeftButton, {}, {220, 80});
+        const auto stroke = canvas->document().annotations.first();
+        QImage expected(1, 1, QImage::Format_ARGB32_Premultiplied);
+        expected.fill(canvas->document().image.pixelColor(120, 80));
+        { QPainter blend(&expected); blend.fillRect(expected.rect(), stroke.color); }
+        check("pen opacity slider produces a translucent stroke", stroke.tool == Tool::Pen &&
+              stroke.color.alpha() == 102 && stroke.width == 18 &&
+              canvas->document().render().pixelColor(120, 80) == expected.pixelColor(0, 0));
+        penOverlay.grab().save(QDir(directory).filePath("capture-pen-opacity.png"));
+        pen->trigger();
+        pen->trigger();
+        check("pen remembers chosen opacity when reactivated", canvas->style().color.alpha() == 102 && qAbs(opacity->value() - 40) < 0.01);
+        opacity->setValue(100);
+        check("pen still supports fully opaque drawing", canvas->style().color.alpha() == 255);
+        QTest::mouseClick(canvas, Qt::LeftButton, {}, {280, 140});
+        check("pen single click produces a visible dot", canvas->document().annotations.size() == 2 &&
+              canvas->document().render().pixelColor(280, 140) == canvas->document().annotations.last().color);
+        pen->trigger();
+        QTest::mouseClick(canvas, Qt::LeftButton, {}, {280, 140});
+        check("pen dot remains selectable in default selection mode", canvas->tool() == Tool::Select && canvas->selectedIndex() == 1);
+        penOverlay.hide();
+    }
+    {
+        Native::Desktop roomy = desktop;
+        roomy.geometry.setHeight(desktop.geometry.height() + uiPixels(400));
+        roomy.screens = {roomy.geometry};
+        roomy.image = QImage(roomy.geometry.size(), QImage::Format_RGB32);
+        roomy.image.fill(Qt::white);
+        CaptureOverlay optionsOverlay(roomy, settings, QRect(-780, 90, 600, 210));
+        optionsOverlay.setAttribute(Qt::WA_DontShowOnScreen);
+        optionsOverlay.show();
+        optionsOverlay.findChild<QAction *>("captureTool1")->trigger();
+        auto *options = optionsOverlay.findChild<QWidget *>("captureToolOptions");
+        auto *canvas = optionsOverlay.findChild<AnnotationCanvas *>();
+        check("secondary options avoid capture region when space permits",
+              options->isVisible() && optionsOverlay.rect().contains(options->geometry()) &&
+              !canvas->geometry().intersects(options->geometry()));
+        optionsOverlay.hide();
+    }
+    {
+        Native::Desktop resizeDesktop = desktop;
+        resizeDesktop.geometry.setHeight(1000);
+        resizeDesktop.screens = {resizeDesktop.geometry};
+        resizeDesktop.image = QImage(resizeDesktop.geometry.size(), QImage::Format_RGB32);
+        resizeDesktop.image.fill(Qt::white);
+        const QRect initial(-780, 80, 460, 260);
+        const QRect local = initial.translated(-resizeDesktop.geometry.topLeft());
+        const QVector<QPoint> starts{local.topLeft(), {local.left() + 65, local.top()}, local.topRight(),
+            {local.right(), local.top() + 65}, local.bottomRight(), {local.left() + 85, local.bottom()},
+            local.bottomLeft(), {local.left(), local.top() + 75}};
+        const QVector<QPoint> deltas{{-20, -15}, {0, -25}, {30, -15}, {30, 0}, {30, 25}, {0, 25}, {-20, 25}, {-20, 0}};
+        const QVector<QRect> expected{initial.adjusted(-20, -15, 0, 0), initial.adjusted(0, -25, 0, 0),
+            initial.adjusted(0, -15, 30, 0), initial.adjusted(0, 0, 30, 0), initial.adjusted(0, 0, 30, 25),
+            initial.adjusted(0, 0, 0, 25), initial.adjusted(-20, 0, 0, 25), initial.adjusted(-20, 0, 0, 0)};
+        auto borderMove = [](QWidget *border, const QPoint &overlayPoint, bool release) {
+            const QPoint point = border->mapFromParent(overlayPoint);
+            QMouseEvent move(QEvent::MouseMove, QPointF(point), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(border, &move);
+            if (release)
+                QTest::mouseRelease(border, Qt::LeftButton, {}, border->mapFromParent(overlayPoint));
+        };
+        for (int handle = 0; handle < starts.size(); ++handle) {
+            CaptureOverlay resizing(resizeDesktop, settings, initial);
+            resizing.setAttribute(Qt::WA_DontShowOnScreen);
+            resizing.show();
+            resizing.findChild<QAction *>("captureTool" + toolKey(Tool::Arrow))->trigger();
+            auto *canvas = resizing.findChild<AnnotationCanvas *>();
+            QTest::mousePress(canvas, Qt::LeftButton, {}, {80, 160});
+            QMouseEvent draw(QEvent::MouseMove, QPointF(180, 60), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(canvas, &draw);
+            QTest::mouseRelease(canvas, Qt::LeftButton, {}, {180, 60});
+            auto style = canvas->style();
+            style.width = 9;
+            canvas->setStyle(style);
+            auto *border = resizing.findChild<QWidget *>("captureResizeBorder");
+            if (handle == 0) {
+                check("resize border is present while annotation tool is active", border->isVisible());
+                check("resize border leaves annotation interior interactive",
+                      !border->mask().contains(border->mapFromParent(local.center())) &&
+                      border->mask().contains(border->mapFromParent(starts[1])));
+                check("widget hit testing sends edges to resize border", resizing.childAt(starts[1]) == border);
+                check("widget hit testing sends interior to annotation canvas", resizing.childAt(local.center()) == canvas);
+            }
+            QTest::mousePress(border, Qt::LeftButton, {}, border->mapFromParent(starts[handle]));
+            borderMove(border, starts[handle] + deltas[handle], handle != 0);
+            if (handle == 0) {
+                const QImage dragging = resizing.grab().toImage();
+                check("annotations remain visible during border dragging",
+                      dragging.pixelColor(local.topLeft() + QPoint(80, 160)) == canvas->document().render().pixelColor(80, 160));
+                QTest::mouseRelease(border, Qt::LeftButton, {}, border->mapFromParent(starts[handle] + deltas[handle]));
+            }
+            const QString suffix = QString::number(handle);
+            check("direct capture edge or corner resize " + suffix, resizing.selectedGlobal() == expected[handle] &&
+                  canvas->document().sourceRect == expected[handle] && canvas->document().image.size() == expected[handle].size());
+            const auto points = canvas->document().annotations.first().points;
+            check("capture resize preserves annotation screen position " + suffix,
+                  points.first() + QPointF(expected[handle].topLeft()) == QPointF(initial.topLeft() + QPoint(80, 160)) &&
+                  points.last() + QPointF(expected[handle].topLeft()) == QPointF(initial.topLeft() + QPoint(180, 60)) &&
+                  canvas->tool() == Tool::Arrow && resizing.findChild<QWidget *>("captureToolOptions")->isVisible());
+            canvas->undo();
+            check("capture resize translates annotation undo history " + suffix,
+                  canvas->document().annotations.size() == 1 && canvas->document().annotations.first().width == 3 &&
+                  canvas->document().annotations.first().points == points);
+            canvas->redo();
+            check("capture resize translates annotation redo history " + suffix,
+                  canvas->document().annotations.first().width == 9 && canvas->document().annotations.first().points == points);
+            if (handle == 0)
+                resizing.grab().save(QDir(directory).filePath("capture-border-sliders.png"));
+            resizing.hide();
+        }
+        CaptureOverlay crossing(resizeDesktop, settings, initial);
+        crossing.setAttribute(Qt::WA_DontShowOnScreen);
+        crossing.show();
+        crossing.findChild<QAction *>("captureTool" + toolKey(Tool::Pen))->trigger();
+        auto *border = crossing.findChild<QWidget *>("captureResizeBorder");
+        QTest::mousePress(border, Qt::LeftButton, {}, border->mapFromParent(local.topLeft()));
+        borderMove(border, local.bottomRight() + QPoint(20, 20), false);
+        borderMove(border, local.bottomRight() + QPoint(50, 40), true);
+        check("corner crossing retains the original opposite corner",
+              crossing.selectedGlobal() == QRect(initial.bottomRight(), initial.bottomRight() + QPoint(50, 40)));
+        QTest::mousePress(border, Qt::LeftButton, {}, border->mapFromParent(
+            crossing.selectedGlobal().translated(-resizeDesktop.geometry.topLeft()).topLeft()));
+        borderMove(border, {-40, -40}, true);
+        check("direct corner resize clamps to captured desktop", crossing.selectedGlobal().topLeft() == resizeDesktop.geometry.topLeft());
+        crossing.hide();
+    }
     for (const auto &region : {QRect(-170, 430, 160, 80), QRect(-879, 1, 40, 30), desktop.geometry}) {
         CaptureOverlay edgeOverlay(desktop, settings, region);
         edgeOverlay.setAttribute(Qt::WA_DontShowOnScreen);
@@ -692,6 +1434,10 @@ int runSelfTests(const QString &directory, bool native) {
         auto *toolbar = edgeOverlay.findChild<QWidget *>("captureEditorToolbar");
         check("edge capture toolbar fits " + QString::number(region.width()),
               toolbar && edgeOverlay.rect().contains(toolbar->geometry()));
+        auto *options = edgeOverlay.findChild<QWidget *>("captureToolOptions");
+        check("edge secondary options fit " + QString::number(region.width()),
+              options && options->isVisible() && edgeOverlay.rect().contains(options->geometry()) &&
+              !toolbar->geometry().intersects(options->geometry()));
         if (region.width() == 160)
             check("bottom-edge toolbar moves above selection", toolbar->geometry().bottom() < 430);
         edgeOverlay.hide();
@@ -705,10 +1451,13 @@ int runSelfTests(const QString &directory, bool native) {
         CaptureOverlay multiOverlay(monitors, settings, QRect(-400, -160, 500, 300));
         multiOverlay.setAttribute(Qt::WA_DontShowOnScreen);
         multiOverlay.show();
+        multiOverlay.findChild<QAction *>("captureTool1")->trigger();
         QCoreApplication::processEvents();
         auto *toolbar = multiOverlay.findChild<QWidget *>("captureEditorToolbar");
         check("multi-screen toolbar uses selection screen",
               toolbar && QRect(0, 0, 880, 520).contains(toolbar->geometry()));
+        check("multi-screen secondary options use selection screen",
+              QRect(0, 0, 880, 520).contains(multiOverlay.findChild<QWidget *>("captureToolOptions")->geometry()));
         multiOverlay.hide();
     }
     for (int i = 0; i < 4; ++i) {
@@ -734,6 +1483,72 @@ int runSelfTests(const QString &directory, bool native) {
     QCoreApplication::processEvents();
     QTest::qWait(100);
     editor->grab().save(QDir(directory).filePath("editor.png"));
+    check("editor has no retired highlighter tool", !editor->findChild<QAction *>("editorTool8"));
+    check("editor defaults to selection without a selection button",
+          editor->canvas()->tool() == Tool::Select && !editor->findChild<QAction *>("editorTool0"));
+    auto *lineButton = editor->findChild<QToolButton *>("editorLineToolButton");
+    auto *lineAction = editor->findChild<QAction *>("editorTool" + toolKey(Tool::Line));
+    auto *arrowAction = editor->findChild<QAction *>("editorTool" + toolKey(Tool::Arrow));
+    check("editor line menu contains exactly line and arrow styles",
+          lineButton && lineButton->menu() && lineButton->menu()->actions().size() == 2 &&
+          lineButton->menu()->actions().contains(lineAction) && lineButton->menu()->actions().contains(arrowAction));
+    if (lineButton && lineAction && arrowAction) {
+        lineAction->trigger();
+        check("editor line style updates the shared button",
+              editor->canvas()->tool() == Tool::Line && lineButton->defaultAction() == lineAction && lineAction->isChecked());
+        editor->canvas()->setTool(Tool::Rectangle);
+        lineButton->click();
+        check("editor line button remembers the chosen style", editor->canvas()->tool() == Tool::Line);
+        QTest::keyClick(editor->canvas(), Qt::Key_Tab);
+        check("editor Tab switch updates the shared button",
+              editor->canvas()->tool() == Tool::Arrow && lineButton->defaultAction() == arrowAction && arrowAction->isChecked());
+        editor->canvas()->setTool(Tool::Polyline);
+        auto *polylineAction = editor->findChild<QAction *>("editorTool" + toolKey(Tool::Polyline));
+        check("editor polyline remains separately available",
+              polylineAction && polylineAction->isChecked() && !arrowAction->isChecked());
+        lineButton->click();
+        lineButton->click();
+        bool inactive = true;
+        for (auto *action : editor->findChildren<QAction *>())
+            if (action->objectName().startsWith("editorTool") && action->isChecked())
+                inactive = false;
+        check("editor active tool click returns to default selection", editor->canvas()->tool() == Tool::Select && inactive);
+    }
+    {
+        auto *width = editor->findChild<ValueSlider *>("editorStrokeWidth");
+        auto *opacity = editor->findChild<ValueSlider *>("editorOpacity");
+        auto *radius = editor->findChild<ValueSlider *>("editorCornerRadius");
+        check("editor numeric style controls use sliders", width && opacity && radius &&
+              editor->findChildren<QAbstractSpinBox *>().isEmpty() && editor->findChildren<ValueSlider *>().size() == 6);
+        auto *canvas = editor->canvas();
+        canvas->setDocument(sampleDocument());
+        canvas->setTool(Tool::Rectangle);
+        canvas->setZoom(1);
+        auto initialStyle = canvas->style();
+        initialStyle.width = 3;
+        canvas->setStyle(initialStyle);
+        QTest::mousePress(canvas, Qt::LeftButton, {}, {100, 100});
+        QMouseEvent drag(QEvent::MouseMove, QPointF(220, 180), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &drag);
+        QTest::mouseRelease(canvas, Qt::LeftButton, {}, {220, 180});
+        width->slider()->setSliderDown(true);
+        width->setValue(8);
+        width->setValue(12);
+        width->setValue(16);
+        width->slider()->setSliderDown(false);
+        check("slider drag updates selected annotation and value readout", canvas->style().width == 16 &&
+              width->findChild<QLabel *>("valueReadout")->text() == "16.0");
+        canvas->undo();
+        check("one undo restores the entire slider drag", canvas->document().annotations.size() == 1 &&
+              canvas->document().annotations.first().width == 3);
+        canvas->redo();
+        check("one redo restores the final slider value", canvas->style().width == 16 && width->value() == 16);
+        opacity->setValue(50);
+        check("editor opacity slider uses percent", canvas->style().color.alpha() == 128);
+        radius->setValue(32);
+        check("editor corner radius slider updates image", canvas->document().cornerRadius == 32);
+        editor->grab().save(QDir(directory).filePath("editor-sliders.png"));
+    }
     editor->hide();
     delete editor;
     document.render().save(QDir(directory).filePath("annotated.png"));
@@ -996,26 +1811,39 @@ int runSelfTests(const QString &directory, bool native) {
             detection.activateWindow();
             detectionReady = QTest::qWaitForWindowExposed(&detection);
         }
-        QCursor::setPos(frozenIcon.center());
-        QTest::qWait(100);
+        // Feed the synthetic snapshot a fixed point; desktop mouse movement must not change the fixture.
+        detection.detectionTimer_.stop();
+        detection.updateDetectionAt(frozenIcon.center());
         QTest::mouseClick(&detection, Qt::LeftButton, {}, localPoint);
         check("capture click selects frozen tray icon", detectionReady && detection.selectedGlobal() == frozenIcon);
         if (detection.selectedGlobal() != frozenIcon)
             qWarning() << "Frozen icon selection" << detection.selectedGlobal() << "expected" << frozenIcon
                        << "overlay" << detection.geometry() << "cursor" << QCursor::pos();
         QTest::mouseClick(&detection, Qt::RightButton, {}, localPoint);
-        QTest::qWait(100);
+        detection.updateDetectionAt(frozenIcon.center());
         QWheelEvent parentWheel(localPoint, frozenIcon.center(), QPoint(), QPoint(0, 120),
                                 Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
         QApplication::sendEvent(&detection, &parentWheel);
-        QTest::qWait(100); // Reapplying the cache must preserve the wheel-selected parent.
+        detection.updateDetectionAt(frozenIcon.center()); // Reapplying the cache must preserve the wheel-selected parent.
         QTest::mouseClick(&detection, Qt::LeftButton, {}, localPoint);
         check("capture wheel retains frozen parent selection", detection.selectedGlobal() == frozenRow);
+        if (detection.selectedGlobal() != frozenRow) {
+            QString detail;
+            QDebug(&detail) << "Frozen parent selection" << detection.selectedGlobal() << "expected" << frozenRow
+                            << "cursor" << QCursor::pos() << "point" << frozenIcon.center();
+            QTextStream(stdout) << detail << '\n';
+        }
         QTest::mouseClick(&detection, Qt::RightButton, {}, localPoint);
         QTest::keyClick(&detection, Qt::Key_Tab);
-        QTest::qWait(100);
+        detection.updateDetectionAt(frozenIcon.center());
         QTest::mouseClick(&detection, Qt::LeftButton, {}, localPoint);
         check("Tab restores window-only selection", detection.selectedGlobal() == popup.geometry);
+        if (detection.selectedGlobal() != popup.geometry) {
+            QString detail;
+            QDebug(&detail) << "Frozen window selection" << detection.selectedGlobal() << "expected" << popup.geometry
+                            << "cursor" << QCursor::pos() << "point" << frozenIcon.center();
+            QTextStream(stdout) << detail << '\n';
+        }
         detection.hide();
         QCursor::setPos(cursorBackup);
     }

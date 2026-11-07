@@ -1,12 +1,11 @@
 #pragma once
 #include "document.h"
 #include "settings.h"
+#include "controls.h"
 #include <QMainWindow>
 #include <QTimer>
 #include <QListWidget>
 
-class QDoubleSpinBox;
-class QSpinBox;
 class QComboBox;
 class QLabel;
 class QListWidget;
@@ -22,10 +21,12 @@ class AnnotationCanvas : public QWidget {
     Tool tool() const;
     Annotation style() const;
     void setStyle(const Annotation &style);
+    void beginStyleChange();
+    void endStyleChange();
     void setZoom(double zoom);
     double zoom() const;
     void setBaseImage(const QImage &image);
-    void setCaptureBackground(const Document &background);
+    void setCaptureBackground(const Document &background, const QPointF &annotationOffset = {});
     void setDocument(const Document &document);
     void setDetectedElements(const QVector<QRect> &elements);
     void setRadius(int radius);
@@ -42,6 +43,7 @@ class AnnotationCanvas : public QWidget {
     int selectedIndex() const;
     bool acceleratedPreview() const;
     bool drawing() const;
+    bool canStartBackgroundDrag(const QPoint &point) const;
   signals:
     void changed();
     void selectionChanged();
@@ -65,13 +67,13 @@ class AnnotationCanvas : public QWidget {
     void checkpoint();
     void redraw();
     void paintContent(QPainter &painter);
-    int objectAt(const QPointF &point, bool sameTool = false) const;
+    int objectAt(const QPointF &point) const;
     bool matchElement(const QPointF &point);
     QPointF imagePoint(const QPoint &point) const;
     void translate(Annotation &item, const QPointF &delta);
     Document document_;
     Settings &settings_;
-    Tool tool_ = Tool::Rectangle;
+    Tool tool_ = Tool::Select;
     Annotation style_;
     QImage rendered_;
     QVector<QVector<Annotation>> undo_;
@@ -86,11 +88,15 @@ class AnnotationCanvas : public QWidget {
     bool polyline_ = false;
     bool polylineDragged_ = false;
     bool pointerDown_ = false;
-    int resizeCorner_ = -1;
+    bool newAnnotation_ = false;
+    bool transformCheckpoint_ = false;
+    int resizeHandle_ = -1;
     bool picker_ = false;
     bool magnifier_ = false;
     bool altUsed_ = false;
     bool penStraight_ = false;
+    bool styleChanging_ = false;
+    bool styleCheckpoint_ = false;
     QPointF anchor_;
     QPointF previous_;
     QPointF hover_;
@@ -151,11 +157,11 @@ class EditorWindow : public QMainWindow {
     void recognize();
     Settings &settings_;
     AnnotationCanvas *canvas_ = nullptr;
-    QDoubleSpinBox *width_ = nullptr;
-    QSpinBox *alpha_ = nullptr;
-    QSpinBox *fontSize_ = nullptr;
-    QDoubleSpinBox *rotation_ = nullptr;
-    QSpinBox *outlineWidth_ = nullptr;
+    ValueSlider *width_ = nullptr;
+    ValueSlider *alpha_ = nullptr;
+    ValueSlider *fontSize_ = nullptr;
+    ValueSlider *rotation_ = nullptr;
+    ValueSlider *outlineWidth_ = nullptr;
     QComboBox *lineStyle_ = nullptr;
     QComboBox *shape_ = nullptr;
     QComboBox *arrow_ = nullptr;

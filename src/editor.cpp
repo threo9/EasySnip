@@ -14,13 +14,38 @@ QTransform annotationTransform(const Annotation &item) {
     return transform;
 }
 
-QVector<QPointF> controlCorners(const Annotation &item) {
+QVector<QPointF> controlPoints(const Annotation &item) {
+    if (isLineTool(item.tool))
+        return item.points;
     const QRectF bounds = item.points.isEmpty() ? item.rect.normalized() : item.bounds();
     return {bounds.topLeft(), bounds.topRight(), bounds.bottomRight(), bounds.bottomLeft()};
 }
 
+QPointF constrainedLineEnd(const QPointF &start, const QPointF &end) {
+    const double radians =
+        qRound(std::atan2(end.y() - start.y(), end.x() - start.x()) / (M_PI / 4)) * M_PI / 4;
+    const double length = QLineF(start, end).length();
+    return start + QPointF(std::cos(radians) * length, std::sin(radians) * length);
+}
+
 QPointF rotationHandle(const Annotation &item, double zoom) {
     return QPointF(item.rect.center().x(), item.bounds().top() - 24 / zoom);
+}
+
+int controlHandleAt(const Annotation &item, const QPointF &point, double zoom) {
+    const QTransform transform = annotationTransform(item);
+    const auto handles = controlPoints(item);
+    int nearest = -1;
+    double distance = 10 / zoom;
+    for (int i = 0; i < handles.size(); ++i) {
+        const double next = QLineF(point, transform.map(handles[i])).length();
+        if (next < distance) { nearest = i; distance = next; }
+    }
+    return nearest;
+}
+
+bool rotationHandleAt(const Annotation &item, const QPointF &point, double zoom) {
+    return !isLineTool(item.tool) && QLineF(point, annotationTransform(item).map(rotationHandle(item, zoom))).length() < 10 / zoom;
 }
 
 class AcceleratedPreview final : public QOpenGLWidget {
@@ -46,6 +71,7 @@ AnnotationCanvas::AnnotationCanvas(Document document, Settings &settings, QWidge
     : QWidget(parent), document_(std::move(document)), settings_(settings) {
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
+    setCursor(Qt::ArrowCursor);
     style_.color = settings_.toolColor(toolKey(tool_));
     for (const auto &item : document_.annotations)
         if (item.tool == Tool::Number)
@@ -74,13 +100,12 @@ int AnnotationCanvas::selectedIndex() const {
     return selected_;
 }
 void AnnotationCanvas::setTool(Tool tool) {
+    endStyleChange();
     finishDrawing();
     tool_ = tool;
     selected_ = -1;
     style_.color = settings_.toolColor(toolKey(tool));
-    style_.shape = settings_.value("annotation/shape/" + toolKey(tool), tool == Tool::Highlighter ? 3 : 0).toInt();
-    if (tool == Tool::Highlighter && !settings_.value("colors/" + toolKey(tool)).isValid())
-        style_.color.setAlpha(100);
+    style_.shape = settings_.value("annotation/shape/" + toolKey(tool), 0).toInt();
     picker_ = false;
     setCursor(tool == Tool::Select ? Qt::ArrowCursor : Qt::CrossCursor);
     emit selectionChanged();
@@ -89,31 +114,60 @@ void AnnotationCanvas::setTool(Tool tool) {
     setFocus();
 }
 Annotation AnnotationCanvas::style() const {
-    return selected_ >= 0 ? document_.annotations[selected_] : style_;
+    if (selected_ >= 0)
+        return document_.annotations[selected_];
+    Annotation next = style_;
+    next.tool = tool_;
+    return next;
 }
 void AnnotationCanvas::setStyle(const Annotation &style) {
-    style_ = style;
-    settings_.setToolColor(toolKey(selected_ >= 0 ? document_.annotations[selected_].tool : tool_),
-                           style.color);
-    settings_.set("annotation/shape/" + toolKey(selected_ >= 0 ? document_.annotations[selected_].tool : tool_),
-                  style.shape);
     if (selected_ >= 0) {
-        checkpoint();
         auto &item = document_.annotations[selected_];
-        item.color = style.color;
-        item.fill = style.fill;
-        item.outline = style.outline;
-        item.width = style.width;
-        item.fontSize = style.fontSize;
-        item.outlineWidth = style.outlineWidth;
-        if (!isLineTool(item.tool))
-            item.rotation = style.rotation;
-        item.lineStyle = style.lineStyle;
-        item.shape = style.shape;
-        item.arrowStyle = style.arrowStyle;
+        Annotation next = item;
+        next.tool = style.tool;
+        next.color = style.color;
+        next.fill = style.fill;
+        next.outline = style.outline;
+        next.width = style.width;
+        next.fontSize = style.fontSize;
+        next.outlineWidth = style.outlineWidth;
+        if (!isLineTool(next.tool))
+            next.rotation = style.rotation;
+        next.lineStyle = style.lineStyle;
+        next.shape = style.shape;
+        next.arrowStyle = style.arrowStyle;
+        if (next.tool == Tool::Text && item.tool == Tool::Number && next.text.isEmpty())
+            next.text = QString::number(item.number);
+        if (item.fontSize != next.fontSize && (next.tool == Tool::Text || next.tool == Tool::Number)) {
+            const double scale = next.fontSize / qMax(1.0, item.fontSize);
+            next.rect.setSize(item.rect.size() * scale);
+            if (next.tool == Tool::Number)
+                next.rect.moveCenter(item.rect.center());
+        }
+        if (next.toJson() == item.toJson())
+            return;
+        // A live drawing already has its creation snapshot. A completed object gets its own style edit.
+        if (!drawing() && (!styleChanging_ || !styleCheckpoint_)) {
+            checkpoint();
+            styleCheckpoint_ = true;
+        }
+        document_.annotations[selected_] = next;
         redraw();
+    } else {
+        // Editing an object must not replace the defaults used by the next drawing.
+        style_ = style;
+        style_.tool = tool_;
+        settings_.setToolColor(toolKey(tool_), style.color);
+        settings_.set("annotation/shape/" + toolKey(tool_), style.shape);
     }
     emit selectionChanged();
+}
+void AnnotationCanvas::beginStyleChange() {
+    styleChanging_ = true;
+    styleCheckpoint_ = false;
+}
+void AnnotationCanvas::endStyleChange() {
+    styleChanging_ = styleCheckpoint_ = false;
 }
 void AnnotationCanvas::setZoom(double zoom) {
     zoom_ = qBound(0.0001, zoom, 8.0);
@@ -135,7 +189,15 @@ void AnnotationCanvas::setBaseImage(const QImage &image) {
         redraw();
     }
 }
-void AnnotationCanvas::setCaptureBackground(const Document &background) {
+void AnnotationCanvas::setCaptureBackground(const Document &background, const QPointF &annotationOffset) {
+    if (!annotationOffset.isNull()) {
+        for (auto &item : document_.annotations)
+            translate(item, annotationOffset);
+        for (auto *history : {&undo_, &redo_})
+            for (auto &snapshot : *history)
+                for (auto &item : snapshot)
+                    translate(item, annotationOffset);
+    }
     document_.image = background.image;
     document_.cornerRadius = background.cornerRadius;
     document_.detectedElements = background.detectedElements;
@@ -143,6 +205,7 @@ void AnnotationCanvas::setCaptureBackground(const Document &background) {
     redraw();
 }
 void AnnotationCanvas::setDocument(const Document &document) {
+    endStyleChange();
     document_ = document;
     undo_.clear();
     redo_.clear();
@@ -175,6 +238,7 @@ void AnnotationCanvas::redraw() {
     emit changed();
 }
 void AnnotationCanvas::undo() {
+    endStyleChange();
     if (undo_.isEmpty())
         return;
     redo_.append(document_.annotations);
@@ -185,6 +249,7 @@ void AnnotationCanvas::undo() {
     emit selectionChanged();
 }
 void AnnotationCanvas::redo() {
+    endStyleChange();
     if (redo_.isEmpty())
         return;
     undo_.append(document_.annotations);
@@ -197,10 +262,6 @@ void AnnotationCanvas::redo() {
             break;
         }
     drawing_ = polyline_ = moving_ = resizing_ = rotating_ = pointerDown_ = false;
-    if (selected_ >= 0) {
-        tool_ = document_.annotations[selected_].tool;
-        emit toolChanged(tool_);
-    }
     redraw();
     emit selectionChanged();
 }
@@ -241,6 +302,7 @@ void AnnotationCanvas::pasteObject() {
     document_.annotations.append(item);
     selected_ = document_.annotations.size() - 1;
     tool_ = Tool::Select;
+    setCursor(Qt::ArrowCursor);
     emit toolChanged(tool_);
     redraw();
     emit selectionChanged();
@@ -274,6 +336,17 @@ void AnnotationCanvas::finishDrawing() {
 bool AnnotationCanvas::drawing() const {
     return drawing_ || polyline_;
 }
+bool AnnotationCanvas::canStartBackgroundDrag(const QPoint &point) const {
+    if (tool_ != Tool::Select || picker_ || drawing())
+        return false;
+    const QPointF local = imagePoint(point);
+    if (objectAt(local) >= 0)
+        return false;
+    if (selected_ < 0)
+        return true;
+    const auto &item = document_.annotations[selected_];
+    return controlHandleAt(item, local, zoom_) < 0 && !rotationHandleAt(item, local, zoom_);
+}
 QPointF AnnotationCanvas::imagePoint(const QPoint &point) const {
     return QPointF(qBound(0.0, point.x() / zoom_, double(document_.image.width() - 1)),
                    qBound(0.0, point.y() / zoom_, double(document_.image.height() - 1)));
@@ -283,23 +356,65 @@ void AnnotationCanvas::translate(Annotation &item, const QPointF &delta) {
     for (auto &point : item.points)
         point += delta;
 }
-int AnnotationCanvas::objectAt(const QPointF &point, bool sameTool) const {
+int AnnotationCanvas::objectAt(const QPointF &point) const {
     for (int i = document_.annotations.size() - 1; i >= 0; --i) {
         const auto &item = document_.annotations[i];
-        if (sameTool && item.tool != tool_)
-            continue;
         const QPointF local = annotationTransform(item).inverted().map(point);
         if (!item.points.isEmpty()) {
+            if (item.tool == Tool::Pen && QLineF(local, item.points.first()).length() <= qMax(5.0 / zoom_, item.width / 2 + 2))
+                return i;
             QPainterPath path;
             path.moveTo(item.points.first());
             for (int j = 1; j < item.points.size(); ++j)
                 path.lineTo(item.points[j]);
             QPainterPathStroker stroke;
             stroke.setWidth(qMax(10.0 / zoom_, item.width + 4));
+            stroke.setCapStyle(Qt::RoundCap);
+            stroke.setJoinStyle(Qt::RoundJoin);
             if (stroke.createStroke(path).contains(local))
                 return i;
-        } else if (item.bounds().contains(local))
-            return i;
+            if (item.tool == Tool::Arrow && item.points.size() > 1) {
+                auto headAt = [&](const QPointF &from, const QPointF &to) {
+                    const double angle = std::atan2(to.y() - from.y(), to.x() - from.x());
+                    const double length = qMax(12.0, item.width * 4);
+                    const QPointF a = to - QPointF(std::cos(angle - M_PI / 6) * length,
+                                                   std::sin(angle - M_PI / 6) * length);
+                    const QPointF b = to - QPointF(std::cos(angle + M_PI / 6) * length,
+                                                   std::sin(angle + M_PI / 6) * length);
+                    QPainterPath head;
+                    head.moveTo(a);
+                    head.lineTo(to);
+                    head.lineTo(b);
+                    if (item.arrowStyle == 3) {
+                        head.closeSubpath();
+                        if (head.contains(local))
+                            return true;
+                    }
+                    return stroke.createStroke(head).contains(local);
+                };
+                if ((item.arrowStyle != 2 && headAt(item.points[item.points.size() - 2], item.points.last())) ||
+                    ((item.arrowStyle == 1 || item.arrowStyle == 2) && headAt(item.points[1], item.points.first())))
+                    return i;
+            }
+        } else {
+            const bool shape = item.tool == Tool::Rectangle || item.tool == Tool::Ellipse ||
+                               item.tool == Tool::RoundedRectangle;
+            if (shape && tool_ != Tool::Select && i != selected_ && item.fill.alpha() == 0) {
+                // Let drawing tools start inside an unselected, unfilled outline.
+                QPainterPath path;
+                if (item.tool == Tool::Ellipse)
+                    path.addEllipse(item.rect.normalized());
+                else if (item.tool == Tool::RoundedRectangle)
+                    path.addRoundedRect(item.rect.normalized(), 14, 14);
+                else
+                    path.addRect(item.rect.normalized());
+                QPainterPathStroker stroke;
+                stroke.setWidth(qMax(10.0 / zoom_, item.width + 4));
+                if (stroke.createStroke(path).contains(local))
+                    return i;
+            } else if (item.bounds().contains(local))
+                return i;
+        }
     }
     return -1;
 }
@@ -327,10 +442,11 @@ void AnnotationCanvas::paintContent(QPainter &painter) {
         const QRectF bounds = item.points.isEmpty() ? item.rect.normalized() : item.bounds();
         painter.setPen(QPen(QColor("#54d6b0"), 1 / zoom_, Qt::DashLine));
         painter.setBrush(Qt::NoBrush);
-        painter.drawRect(bounds);
+        if (!isLineTool(item.tool))
+            painter.drawRect(bounds);
         painter.setBrush(QColor("#54d6b0"));
-        for (const auto &corner : controlCorners(item))
-            painter.drawRect(QRectF(corner - QPointF(4 / zoom_, 4 / zoom_), QSizeF(8 / zoom_, 8 / zoom_)));
+        for (const auto &point : controlPoints(item))
+            painter.drawRect(QRectF(point - QPointF(4 / zoom_, 4 / zoom_), QSizeF(8 / zoom_, 8 / zoom_)));
         if (!isLineTool(item.tool)) {
             const QPointF handle = rotationHandle(item, zoom_);
             painter.drawLine(QPointF(bounds.center().x(), bounds.top()), handle);
@@ -391,30 +507,28 @@ void AnnotationCanvas::mousePressEvent(QMouseEvent *event) {
         return;
     }
     anchor_ = previous_ = point;
+    endStyleChange();
+    newAnnotation_ = transformCheckpoint_ = false;
     penStraight_ = false;
     pointerDown_ = true;
-    resizeCorner_ = -1;
+    resizeHandle_ = -1;
     resizing_ = rotating_ = false;
     if (selected_ >= 0) {
         const auto &item = document_.annotations[selected_];
-        const QTransform transform = annotationTransform(item);
-        const auto corners = controlCorners(item);
-        for (int i = 0; i < corners.size(); ++i)
-            if (QLineF(point, transform.map(corners[i])).length() < 10 / zoom_)
-                resizeCorner_ = i;
-        resizing_ = resizeCorner_ >= 0;
-        rotating_ = !isLineTool(item.tool) &&
-                    QLineF(point, transform.map(rotationHandle(item, zoom_))).length() < 10 / zoom_;
+        resizeHandle_ = controlHandleAt(item, point, zoom_);
+        resizing_ = resizeHandle_ >= 0;
+        rotating_ = rotationHandleAt(item, point, zoom_);
     }
-    const int hit = objectAt(point, tool_ != Tool::Select);
+    const int hit = objectAt(point);
     if (tool_ == Tool::Select || resizing_ || rotating_ || hit >= 0) {
         if (!resizing_ && !rotating_)
             selected_ = hit;
         if (selected_ >= 0) {
-            checkpoint();
             if (!resizing_ && !rotating_ &&
                 (event->modifiers().testFlag(Qt::ControlModifier) ||
                  event->modifiers().testFlag(Qt::AltModifier))) {
+                checkpoint();
+                transformCheckpoint_ = true;
                 document_.annotations.append(document_.annotations[selected_]);
                 selected_ = document_.annotations.size() - 1;
             }
@@ -461,6 +575,7 @@ void AnnotationCanvas::mousePressEvent(QMouseEvent *event) {
     }
     checkpoint();
     document_.annotations.append(item);
+    newAnnotation_ = true;
     selected_ = document_.annotations.size() - 1;
     redraw();
     emit selectionChanged();
@@ -483,6 +598,7 @@ bool AnnotationCanvas::matchElement(const QPointF &point) {
     item.rotation = 0;
     checkpoint();
     document_.annotations.append(item);
+    newAnnotation_ = true;
     selected_ = document_.annotations.size() - 1;
     redraw();
     emit selectionChanged();
@@ -501,6 +617,8 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
         return;
     }
     auto &item = document_.annotations[selected_];
+    const bool pendingTransform = (moving_ || resizing_ || rotating_) && !transformCheckpoint_;
+    const Annotation before = pendingTransform ? item : Annotation();
     if (moving_)
         translate(item, point - previous_);
     else if (rotating_) {
@@ -511,14 +629,28 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
         if (event->modifiers().testFlag(Qt::ShiftModifier))
             angle = qRound(angle / 15) * 15;
         item.rotation = std::remainder(angle, 360.0);
+    } else if (resizing_ && isLineTool(original_.tool)) {
+        item = original_;
+        // Keep every other vertex fixed in image coordinates, including imported rotations.
+        const QTransform transform = annotationTransform(original_);
+        for (auto &vertex : item.points)
+            vertex = transform.map(vertex);
+        QPointF end = point;
+        if (event->modifiers().testFlag(Qt::ShiftModifier) && item.points.size() > 1) {
+            const int fixed = resizeHandle_ == 0 ? 1 : resizeHandle_ - 1;
+            end = constrainedLineEnd(item.points[fixed], point);
+        }
+        item.points[resizeHandle_] = end;
+        item.rotation = 0;
+        item.rect = QPolygonF(item.points).boundingRect();
     } else if (resizing_) {
         if (original_.tool == Tool::Text && event->modifiers().testFlag(Qt::ShiftModifier))
             original_.rotation = 0;
-        const auto corners = controlCorners(original_);
-        const QPointF fixed = corners[(resizeCorner_ + 2) % 4];
+        const auto corners = controlPoints(original_);
+        const QPointF fixed = corners[(resizeHandle_ + 2) % 4];
         const QTransform transform = annotationTransform(original_);
         const QPointF local = transform.inverted().map(point);
-        const QPointF diagonal = corners[resizeCorner_] - fixed;
+        const QPointF diagonal = corners[resizeHandle_] - fixed;
         double sx = qAbs(diagonal.x()) < 0.01 ? 1 : qMax(0.05, (local.x() - fixed.x()) / diagonal.x());
         double sy = qAbs(diagonal.y()) < 0.01 ? 1 : qMax(0.05, (local.y() - fixed.y()) / diagonal.y());
         if (original_.tool == Tool::Text || event->modifiers().testFlag(Qt::ShiftModifier)) {
@@ -553,10 +685,7 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
                 const QPointF start = (item.tool == Tool::Polyline || brush)
                                           ? item.points[item.points.size() - 2]
                                           : anchor_;
-                const QLineF line(start, point);
-                const double radians =
-                    qRound(std::atan2(point.y() - start.y(), point.x() - start.x()) / (M_PI / 4)) * M_PI / 4;
-                end = start + QPointF(std::cos(radians) * line.length(), std::sin(radians) * line.length());
+                end = constrainedLineEnd(start, point);
             } else {
                 const double side = qMax(qAbs(point.x() - anchor_.x()), qAbs(point.y() - anchor_.y()));
                 end = anchor_ + QPointF(point.x() >= anchor_.x() ? side : -side,
@@ -584,6 +713,13 @@ void AnnotationCanvas::mouseMoveEvent(QMouseEvent *event) {
         return;
     }
     previous_ = point;
+    if (pendingTransform && item.toJson() != before.toJson()) {
+        const Annotation transformed = item;
+        item = before;
+        checkpoint();
+        document_.annotations[selected_] = transformed;
+        transformCheckpoint_ = true;
+    }
     redraw();
 }
 void AnnotationCanvas::mouseReleaseEvent(QMouseEvent *event) {
@@ -594,8 +730,9 @@ void AnnotationCanvas::mouseReleaseEvent(QMouseEvent *event) {
         polyline_ = false;
     if (!polyline_) {
         drawing_ = false;
-        if (!settings_.value("annotation/selectNew", true).toBool() && tool_ != Tool::Select)
+        if (newAnnotation_ && !settings_.value("annotation/selectNew", true).toBool())
             selected_ = -1;
+        newAnnotation_ = false;
     }
     update();
     emit selectionChanged();
@@ -681,6 +818,7 @@ void AnnotationCanvas::keyPressEvent(QKeyEvent *event) {
     if (event->key() == Qt::Key_Escape) {
         finishDrawing();
         selected_ = -1;
+        emit selectionChanged();
         update();
         return;
     }
@@ -960,17 +1098,38 @@ EditorWindow::EditorWindow(Document document, Settings &settings, const QRect &s
     auto *tools = new QHBoxLayout(toolContainer);
     tools->setSpacing(4);
     tools->setContentsMargins(0, 0, 0, 0);
-    auto *group = new QButtonGroup(this);
+    auto *group = new QActionGroup(this);
     group->setExclusive(true);
-    for (int i = 0; i <= int(Tool::Magnify); ++i) {
+    for (int i = int(Tool::Rectangle); i <= int(Tool::Magnify); ++i) {
+        if (Tool(i) == Tool::Arrow || toolName(Tool(i)).isEmpty())
+            continue;
         auto *button = new QToolButton;
-        button->setText(toolName(Tool(i)));
-        button->setCheckable(true);
-        button->setToolTip(toolName(Tool(i)));
-        group->addButton(button, i);
+        button->setFocusPolicy(Qt::NoFocus);
+        const bool lineGroup = Tool(i) == Tool::Line;
+        const QVector<Tool> variants = lineGroup ? QVector<Tool>{Tool::Arrow, Tool::Line}
+                                                 : QVector<Tool>{Tool(i)};
+        QMenu *menu = lineGroup ? new QMenu(button) : nullptr;
+        for (Tool tool : variants) {
+            auto *action = new QAction(toolName(tool), group);
+            action->setObjectName("editorTool" + toolKey(tool));
+            action->setData(int(tool));
+            action->setCheckable(true);
+            action->setToolTip(lineGroup ? toolName(tool) + QStringLiteral(" · 拖动两端调整 · Tab 切换")
+                                         : toolName(tool));
+            group->addAction(action);
+            if (menu)
+                menu->addAction(action);
+            if (tool == variants.first())
+                button->setDefaultAction(action);
+            connect(action, &QAction::triggered, button, [button, action] { button->setDefaultAction(action); });
+        }
+        if (menu) {
+            button->setObjectName("editorLineToolButton");
+            menu->setObjectName("editorLineToolMenu");
+            button->setMenu(menu);
+            button->setPopupMode(QToolButton::MenuButtonPopup);
+        }
         tools->addWidget(button);
-        if (i == int(Tool::Rectangle))
-            button->setChecked(true);
     }
     tools->addStretch();
     auto *toolScroll = new QScrollArea;
@@ -1035,25 +1194,24 @@ EditorWindow::EditorWindow(Document document, Settings &settings, const QRect &s
     connect(color_, &QPushButton::clicked, this, [pick] { pick(0); });
     connect(fill_, &QPushButton::clicked, this, [pick] { pick(1); });
     connect(outline_, &QPushButton::clicked, this, [pick] { pick(2); });
-    width_ = new QDoubleSpinBox;
-    width_->setRange(1, 100);
+    width_ = new ValueSlider(1, 100, 0.1, 1);
+    width_->setObjectName("editorStrokeWidth");
     width_->setValue(3);
     form->addRow(QStringLiteral("粗细"), width_);
     form->addRow(QStringLiteral("笔尖"), new BrushTips(canvas_, settings_));
-    alpha_ = new QSpinBox;
-    alpha_->setRange(0, 255);
-    alpha_->setValue(255);
-    form->addRow(QStringLiteral("Alpha"), alpha_);
-    fontSize_ = new QSpinBox;
-    fontSize_->setRange(6, 300);
+    alpha_ = new ValueSlider(0, 100, 100.0 / 255, 0, "%");
+    alpha_->setObjectName("editorOpacity");
+    alpha_->setValue(100);
+    form->addRow(QStringLiteral("不透明度"), alpha_);
+    fontSize_ = new ValueSlider(6, 300);
+    fontSize_->setObjectName("editorFontSize");
     fontSize_->setValue(24);
     form->addRow(QStringLiteral("字号"), fontSize_);
-    outlineWidth_ = new QSpinBox;
-    outlineWidth_->setRange(0, 20);
+    outlineWidth_ = new ValueSlider(0, 20);
+    outlineWidth_->setObjectName("editorOutlineWidth");
     form->addRow(QStringLiteral("描边宽度"), outlineWidth_);
-    rotation_ = new QDoubleSpinBox;
-    rotation_->setRange(-360, 360);
-    rotation_->setSuffix(QStringLiteral("°"));
+    rotation_ = new ValueSlider(-360, 360, 1, 0, QStringLiteral("°"));
+    rotation_->setObjectName("editorRotation");
     form->addRow(QStringLiteral("旋转"), rotation_);
     lineStyle_ = new QComboBox;
     lineStyle_->addItems({QStringLiteral("实线"), QStringLiteral("虚线"), QStringLiteral("点线")});
@@ -1065,15 +1223,16 @@ EditorWindow::EditorWindow(Document document, Settings &settings, const QRect &s
     arrow_->addItems({QStringLiteral("单向开放"), QStringLiteral("双向"), QStringLiteral("反向"),
                       QStringLiteral("实心箭头")});
     form->addRow(QStringLiteral("箭头"), arrow_);
-    auto *radius = new QSpinBox;
-    radius->setRange(0, 500);
+    auto *radius = new ValueSlider(0, 500);
+    radius->setObjectName("editorCornerRadius");
     radius->setValue(canvas_->document().cornerRadius);
     form->addRow(QStringLiteral("图像圆角"), radius);
-    connect(radius, QOverload<int>::of(&QSpinBox::valueChanged), canvas_, &AnnotationCanvas::setRadius);
-    for (auto *spin : {alpha_, fontSize_, outlineWidth_})
-        connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this, &EditorWindow::updateStyle);
-    for (auto *spin : {width_, rotation_})
-        connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &EditorWindow::updateStyle);
+    connect(radius, &ValueSlider::valueChanged, canvas_, [this](double value) { canvas_->setRadius(qRound(value)); });
+    for (auto *slider : {width_, alpha_, fontSize_, outlineWidth_, rotation_}) {
+        connect(slider, &ValueSlider::valueChanged, this, &EditorWindow::updateStyle);
+        connect(slider, &ValueSlider::editingStarted, canvas_, &AnnotationCanvas::beginStyleChange);
+        connect(slider, &ValueSlider::editingFinished, canvas_, &AnnotationCanvas::endStyleChange);
+    }
     for (auto *combo : {lineStyle_, shape_, arrow_})
         connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &EditorWindow::updateStyle);
     auto *footer = new QHBoxLayout;
@@ -1098,14 +1257,22 @@ EditorWindow::EditorWindow(Document document, Settings &settings, const QRect &s
                        : ratios[index]);
     });
     outer->addLayout(footer);
-    connect(group, QOverload<int>::of(&QButtonGroup::buttonClicked), this, [this](int id) {
-        canvas_->setTool(Tool(id));
+    connect(group, &QActionGroup::triggered, this, [this](QAction *action) {
+        const Tool requested = Tool(action->data().toInt());
+        canvas_->setTool(canvas_->tool() == requested ? Tool::Select : requested);
         syncInspector();
     });
     connect(canvas_, &AnnotationCanvas::selectionChanged, this, &EditorWindow::syncInspector);
-    connect(canvas_, &AnnotationCanvas::toolChanged, this, [group](Tool tool) {
-        if (auto *button = group->button(int(tool)))
-            button->setChecked(true);
+    connect(canvas_, &AnnotationCanvas::toolChanged, this, [this, group](Tool tool) {
+        for (auto *action : group->actions()) {
+            const bool active = action->data().toInt() == int(tool);
+            action->setChecked(active);
+            if (active) {
+                for (auto *button : findChildren<QToolButton *>())
+                    if (button->menu() && button->menu()->actions().contains(action))
+                        button->setDefaultAction(action);
+            }
+        }
     });
     connect(canvas_, &AnnotationCanvas::colorPicked, this, [this](const QString &text) {
         statusBar()->showMessage(QStringLiteral("已复制色值 ") + text, 4000);
@@ -1134,7 +1301,7 @@ void EditorWindow::syncInspector() {
     const QSignalBlocker a(width_), b(alpha_), c(fontSize_), d(outlineWidth_), e(rotation_), f(lineStyle_),
         g(shape_), h(arrow_);
     width_->setValue(style.width);
-    alpha_->setValue(style.color.alpha());
+    alpha_->setValue(style.color.alphaF() * 100);
     fontSize_->setValue(qRound(style.fontSize));
     outlineWidth_->setValue(qRound(style.outlineWidth));
     rotation_->setValue(style.rotation);
@@ -1151,7 +1318,7 @@ void EditorWindow::syncInspector() {
 void EditorWindow::updateStyle() {
     auto style = canvas_->style();
     style.width = width_->value();
-    style.color.setAlpha(alpha_->value());
+    style.color.setAlpha(qRound(alpha_->value() * 255 / 100));
     style.fontSize = fontSize_->value();
     style.outlineWidth = outlineWidth_->value();
     style.rotation = rotation_->value();

@@ -3,6 +3,7 @@
 #include <QPainter>
 #include <QTransform>
 #include <QtMath>
+#include <algorithm>
 #include <ReadBarcode.h>
 #include <DecodeHints.h>
 #include <Result.h>
@@ -11,7 +12,7 @@
 QString toolName(Tool tool) {
     static const QStringList names{QStringLiteral("选择"),   QStringLiteral("矩形"), QStringLiteral("椭圆"),
                                    QStringLiteral("圆角"),   QStringLiteral("直线"), QStringLiteral("箭头"),
-                                   QStringLiteral("折线"),   QStringLiteral("画笔"), QStringLiteral("高亮"),
+                                   QStringLiteral("折线"),   QStringLiteral("画笔"), QString(),
                                    QStringLiteral("马赛克"), QStringLiteral("模糊"), QStringLiteral("橡皮"),
                                    QStringLiteral("文字"),   QStringLiteral("序号"), QStringLiteral("放大")};
     return names.value(int(tool));
@@ -23,7 +24,7 @@ bool isLineTool(Tool tool) {
     return tool == Tool::Line || tool == Tool::Arrow || tool == Tool::Polyline;
 }
 bool isEffectTool(Tool tool) {
-    return tool == Tool::Highlighter || tool == Tool::Mosaic || tool == Tool::Blur || tool == Tool::Eraser;
+    return tool == Tool::Mosaic || tool == Tool::Blur || tool == Tool::Eraser;
 }
 
 QRectF Annotation::bounds() const {
@@ -62,7 +63,8 @@ QJsonObject Annotation::toJson() const {
 }
 Annotation Annotation::fromJson(const QJsonObject &object) {
     Annotation item;
-    item.tool = Tool(qBound(0, object["tool"].toInt(1), int(Tool::Magnify)));
+    const int storedTool = qBound(0, object["tool"].toInt(1), int(Tool::Magnify));
+    item.tool = storedTool == 8 ? Tool::Pen : Tool(storedTool);
     const auto rect = object["rect"].toArray();
     item.rect = QRectF(rect[0].toDouble(), rect[1].toDouble(), rect[2].toDouble(), rect[3].toDouble());
     for (const auto &point : object["points"].toArray()) {
@@ -81,6 +83,31 @@ Annotation Annotation::fromJson(const QJsonObject &object) {
     item.arrowStyle = qBound(0, object["arrowStyle"].toInt(), 3);
     item.number = object["number"].toInt(1);
     item.text = object["text"].toString();
+    if (storedTool == 8) {
+        // Convert retired highlighter records to ordinary strokes or filled shapes.
+        item.lineStyle = int(Qt::SolidLine);
+        if (item.shape == 3 && !item.points.isEmpty()) {
+            if (item.points.size() == 1)
+                item.points.append(item.points.first());
+        } else {
+            const QRectF original = item.rect.normalized();
+            item.tool = item.shape == 1 || item.shape == 2 ? Tool::Ellipse : Tool::Rectangle;
+            item.fill = item.color;
+            item.color = Qt::transparent;
+            item.rect = original;
+            item.points.clear();
+            if (item.shape == 2) {
+                const double size = qMin(original.width(), original.height());
+                item.rect.setSize(QSizeF(size, size));
+                QTransform transform;
+                transform.translate(original.center().x(), original.center().y());
+                transform.rotate(item.rotation);
+                transform.translate(-original.center().x(), -original.center().y());
+                item.rect.translate(transform.map(item.rect.center()) - item.rect.center());
+            }
+        }
+        item.shape = 0;
+    }
     return item;
 }
 
@@ -207,6 +234,15 @@ QImage Document::render(bool frame) const {
         case Tool::Arrow:
         case Tool::Polyline:
         case Tool::Pen: {
+            if (item.points.isEmpty())
+                break;
+            if (item.tool == Tool::Pen && std::all_of(item.points.cbegin(), item.points.cend(),
+                [&](const QPointF &point) { return point == item.points.first(); })) {
+                painter.setPen(Qt::NoPen);
+                painter.setBrush(item.color);
+                painter.drawEllipse(item.points.first(), item.width / 2, item.width / 2);
+                break;
+            }
             if (item.points.size() < 2)
                 break;
             painter.drawPolyline(item.points.constData(), item.points.size());
@@ -216,10 +252,6 @@ QImage Document::render(bool frame) const {
                 if (item.arrowStyle == 1 || item.arrowStyle == 2)
                     arrowHead(painter, item.points[1], item.points.first(), item);
             }
-            break;
-        }
-        case Tool::Highlighter: {
-            painter.fillPath(effectPath(item), item.color);
             break;
         }
         case Tool::Eraser:

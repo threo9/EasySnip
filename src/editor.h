@@ -157,12 +157,13 @@ class EditorWindow : public QMainWindow {
     void recognize();
     Settings &settings_;
     AnnotationCanvas *canvas_ = nullptr;
+    LineTypeButton *lineType_ = nullptr;
     ValueSlider *width_ = nullptr;
     ValueSlider *alpha_ = nullptr;
     ValueSlider *fontSize_ = nullptr;
     ValueSlider *rotation_ = nullptr;
     ValueSlider *outlineWidth_ = nullptr;
-    QComboBox *lineStyle_ = nullptr;
+    OptionStrip *lineStyle_ = nullptr;
     QComboBox *shape_ = nullptr;
     QComboBox *arrow_ = nullptr;
     QPushButton *color_ = nullptr;

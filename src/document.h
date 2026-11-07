@@ -44,6 +44,7 @@ struct Annotation {
     int number = 1;
     QString text;
     QRectF bounds() const;
+    QPainterPath effectPath() const;
     QJsonObject toJson() const;
     static Annotation fromJson(const QJsonObject &object);
 };

@@ -1,4 +1,5 @@
 #include "library.h"
+#include "appearance.h"
 #include <QtWidgets>
 
 namespace {
@@ -28,6 +29,54 @@ bool readArchiveBytes(QDataStream &stream, QByteArray &bytes, quint32 maximum) {
     bytes.resize(int(size));
     return stream.readRawData(bytes.data(), int(size)) == int(size);
 }
+
+class HistoryItemDelegate final : public QStyledItemDelegate {
+  public:
+    explicit HistoryItemDelegate(QObject *parent) : QStyledItemDelegate(parent) {}
+    QSize sizeHint(const QStyleOptionViewItem &, const QModelIndex &) const override {
+        return QSize(uiPixels(246), uiPixels(222));
+    }
+    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override {
+        painter->save();
+        painter->setRenderHint(QPainter::Antialiasing);
+        const QRect card = option.rect.adjusted(uiPixels(4), uiPixels(4), -uiPixels(4), -uiPixels(4));
+        const bool selected = option.state & QStyle::State_Selected;
+        const bool hovered = option.state & QStyle::State_MouseOver;
+        painter->setPen(QPen(selected ? Ui::accent() : QColor(hovered ? "#c5c5c5" : "#dedede"), selected ? 1.5 : 1));
+        painter->setBrush(QColor(selected ? "#f5f9ff" : "#ffffff"));
+        painter->drawRoundedRect(QRectF(card).adjusted(0.5, 0.5, -0.5, -0.5), uiPixels(7), uiPixels(7));
+        const QRect preview = card.adjusted(uiPixels(8), uiPixels(8), -uiPixels(8), -uiPixels(66));
+        QPainterPath clip;
+        clip.addRoundedRect(preview, uiPixels(4), uiPixels(4));
+        painter->save();
+        painter->setClipPath(clip);
+        painter->fillRect(preview, QColor("#f1f1f1"));
+        const auto icon = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
+        const QPixmap image = icon.pixmap(preview.size() * 2);
+        const QSize size = image.size().scaled(preview.size(), Qt::KeepAspectRatio);
+        painter->setRenderHint(QPainter::SmoothPixmapTransform);
+        painter->drawPixmap(QRect(preview.center() - QPoint(size.width() / 2, size.height() / 2), size), image);
+        painter->restore();
+        const QStringList lines = index.data(Qt::DisplayRole).toString().split('\n');
+        QFont font = option.font;
+        font.setPixelSize(uiPixels(13));
+        font.setWeight(QFont::DemiBold);
+        painter->setFont(font);
+        painter->setPen(QColor("#242424"));
+        const QRect title(card.left() + uiPixels(13), preview.bottom() + uiPixels(12), card.width() - uiPixels(26), uiPixels(21));
+        painter->drawText(title, Qt::AlignLeft | Qt::AlignVCenter,
+                          QFontMetrics(font).elidedText(lines.value(0), Qt::ElideRight, title.width()));
+        font.setWeight(QFont::Normal);
+        font.setPixelSize(uiPixels(11));
+        painter->setFont(font);
+        painter->setPen(QColor("#666666"));
+        const QRect detail = title.translated(0, uiPixels(24));
+        const QString metadata = lines.value(1) + QStringLiteral("   ·   ") + index.data(Qt::UserRole + 1).toString();
+        painter->drawText(detail, Qt::AlignLeft | Qt::AlignVCenter,
+                          QFontMetrics(font).elidedText(metadata, Qt::ElideRight, detail.width()));
+        painter->restore();
+    }
+};
 } // namespace
 QJsonObject Record::toJson() const {
     return {{"version", 1},
@@ -291,39 +340,61 @@ LibraryWindow::LibraryWindow(Library &library, Settings &settings) : library_(li
     setCentralWidget(root);
     auto *sidebar = new QFrame;
     sidebar->setObjectName("sidebar");
-    sidebar->setFixedWidth(uiPixels(220));
+    sidebar->setFixedWidth(uiPixels(208));
     auto *side = new QVBoxLayout(sidebar);
-    side->setContentsMargins(22, 28, 20, 22);
-    side->setSpacing(16);
+    side->setContentsMargins(uiPixels(18), uiPixels(28), uiPixels(18), uiPixels(20));
+    side->setSpacing(uiPixels(12));
     auto *brand = new QLabel("EasySnip");
     brand->setObjectName("brand");
     side->addWidget(brand);
     auto *tagline = new QLabel(QStringLiteral("截图 · 标注 · 保存"));
     tagline->setObjectName("muted");
     side->addWidget(tagline);
-    auto *capture = new QPushButton(QStringLiteral("＋  开始截图"));
+    side->addSpacing(uiPixels(12));
+    auto *capture = new QPushButton(QStringLiteral("开始截图"));
     capture->setObjectName("primary");
     side->addWidget(capture);
+    capture->setToolTip(QStringLiteral("区域截图 · %1").arg(settings.shortcut("capture")));
     connect(capture, &QPushButton::clicked, this, [this] { emit command("capture"); });
+    auto *shortcut = new QLabel(QStringLiteral("按 %1 随时截图").arg(settings.shortcut("capture")));
+    shortcut->setObjectName("muted");
+    shortcut->setAlignment(Qt::AlignCenter);
+    side->addWidget(shortcut);
+    side->addSpacing(uiPixels(16));
+    auto *history = new QPushButton(Ui::commandIcon("history"), QStringLiteral("截图历史"));
+    history->setProperty("navItem", true);
+    history->setCheckable(true);
+    history->setChecked(true);
+    side->addWidget(history);
+    connect(history, &QPushButton::clicked, this, [this, history] {
+        history->setChecked(true);
+        search_->clear();
+        refresh();
+    });
+    auto *preset = new QPushButton(Ui::commandIcon("capture"), QStringLiteral("预设与延时"));
+    preset->setProperty("navItem", true);
+    side->addWidget(preset);
+    connect(preset, &QPushButton::clicked, this, [this] { emit command("preset"); });
     side->addStretch(1);
-    auto *preferences = new QPushButton(QStringLiteral("设置"));
+    auto *preferences = new QPushButton(Ui::commandIcon("settings"), QStringLiteral("设置"));
+    preferences->setProperty("navItem", true);
     side->addWidget(preferences);
     connect(preferences, &QPushButton::clicked, this, [this] { emit command("settings"); });
-    auto *version = new QLabel("Qt 5.14.2  ·  Windows");
+    auto *version = new QLabel("EasySnip  " + QApplication::applicationVersion());
     version->setObjectName("muted");
     side->addWidget(version);
     layout->addWidget(sidebar);
     auto *content = new QWidget;
     auto *body = new QVBoxLayout(content);
-    body->setContentsMargins(30, 28, 30, 20);
-    body->setSpacing(14);
+    body->setContentsMargins(uiPixels(28), uiPixels(28), uiPixels(28), uiPixels(20));
+    body->setSpacing(uiPixels(16));
     layout->addWidget(content, 1);
     auto *top = new QHBoxLayout;
     auto *heading = new QLabel(QStringLiteral("截图历史"));
     heading->setObjectName("heading");
     top->addWidget(heading);
     top->addStretch();
-    auto *import = new QPushButton(QStringLiteral("打开图片"));
+    auto *import = new QPushButton(Ui::commandIcon("open"), QStringLiteral("打开图片"));
     top->addWidget(import);
     connect(import, &QPushButton::clicked, this, [this] {
         const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("打开图片"), {},
@@ -337,6 +408,9 @@ LibraryWindow::LibraryWindow(Library &library, Settings &settings) : library_(li
     body->addWidget(summary_);
     auto *filter = new QHBoxLayout;
     search_ = new QLineEdit;
+    search_->setObjectName("historySearch");
+    search_->setClearButtonEnabled(true);
+    search_->addAction(Ui::commandIcon("search"), QLineEdit::LeadingPosition);
     search_->setPlaceholderText(QStringLiteral("搜索日期或标题"));
     filter->addWidget(search_, 1);
     auto *extra = new QPushButton(QStringLiteral("管理"));
@@ -350,15 +424,21 @@ LibraryWindow::LibraryWindow(Library &library, Settings &settings) : library_(li
         connect(menu->addAction(pair.first), &QAction::triggered, this,
                 [this, pair] { emit command(pair.second); });
     extra->setMenu(menu);
+    extra->setProperty("hasMenu", true);
     filter->addWidget(extra);
     body->addLayout(filter);
     gallery_ = new QListWidget;
+    gallery_->setObjectName("historyGallery");
+    gallery_->setItemDelegate(new HistoryItemDelegate(gallery_));
     gallery_->setViewMode(QListView::IconMode);
     gallery_->setResizeMode(QListView::Adjust);
     gallery_->setMovement(QListView::Static);
     gallery_->setIconSize(QSize(uiPixels(220), uiPixels(150)));
-    gallery_->setGridSize(QSize(uiPixels(246), uiPixels(208)));
-    gallery_->setSpacing(8);
+    gallery_->setGridSize(QSize(uiPixels(254), uiPixels(230)));
+    gallery_->setSpacing(0);
+    gallery_->setMouseTracking(true);
+    gallery_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    gallery_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     gallery_->setWordWrap(true);
     gallery_->setSelectionMode(QAbstractItemView::ExtendedSelection);
     gallery_->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -366,8 +446,8 @@ LibraryWindow::LibraryWindow(Library &library, Settings &settings) : library_(li
     empty_ = new QLabel(QStringLiteral("按 %1 捕捉第一个画面\n也可以打开图片，或把图片文件拖到这里。")
                            .arg(settings_.shortcut("capture")));
     empty_->setAlignment(Qt::AlignCenter);
-    empty_->setStyleSheet(QString("color:#8fa0b9;font-size:%1px;padding:50px").arg(uiPixels(17)));
-    body->addWidget(empty_);
+    empty_->setStyleSheet(Ui::scaledStyle("color:#646464;font-size:16px;padding:28px;"));
+    body->addWidget(empty_, 1);
     auto *help = new QLabel(QStringLiteral("双击编辑 · 右键复制、保存或管理截图"));
     help->setObjectName("muted");
     body->addWidget(help);
@@ -395,6 +475,8 @@ void LibraryWindow::refresh() {
                                                             .arg(record.imageSize.height()),
                                          gallery_);
         item->setData(Qt::UserRole, record.id);
+        item->setData(Qt::UserRole + 1, record.created.toString("MM-dd HH:mm"));
+        item->setToolTip(record.title + '\n' + record.created.toString("yyyy-MM-dd HH:mm:ss"));
         item->setTextAlignment(Qt::AlignHCenter);
         if (record.id == selectedId)
             gallery_->setCurrentItem(item);
@@ -402,6 +484,10 @@ void LibraryWindow::refresh() {
     }
     summary_->setText(QStringLiteral("%1 张图像").arg(count));
     empty_->setVisible(count == 0);
+    empty_->setText(query.isEmpty()
+        ? QStringLiteral("按 %1 捕捉第一个画面\n\n也可以打开图片，或把图片文件拖到这里。")
+              .arg(settings_.shortcut("capture"))
+        : QStringLiteral("没有找到匹配的截图\n\n试试其他标题或日期。"));
     gallery_->setVisible(count > 0);
 }
 void LibraryWindow::itemMenu(const QPoint &point) {

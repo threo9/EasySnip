@@ -1,4 +1,5 @@
 #include "settings.h"
+#include "appearance.h"
 #include "native.h"
 #include <QtWidgets>
 #include <functional>
@@ -70,96 +71,61 @@ int uiPixels(int pixels) {
 }
 
 void applyAppearance(const Settings &settings) {
-    const double systemScale = QGuiApplication::primaryScreen()->logicalDotsPerInch() / 96.0;
-    const double scale = qBound(1.0, settings.value("appearance/uiScale", systemScale).toDouble(), 3.0);
-    qApp->setProperty("EasySnipUiScale", scale);
-    qApp->setStyle("Fusion");
-    QPalette palette;
-    palette.setColor(QPalette::Window, QColor("#10151e"));
-    palette.setColor(QPalette::WindowText, QColor("#e8edf5"));
-    palette.setColor(QPalette::Base, QColor("#1a2332"));
-    palette.setColor(QPalette::AlternateBase, QColor("#232d3e"));
-    palette.setColor(QPalette::Text, QColor("#e8edf5"));
-    palette.setColor(QPalette::Button, QColor("#232d3e"));
-    palette.setColor(QPalette::ButtonText, QColor("#e8edf5"));
-    palette.setColor(QPalette::Highlight, QColor("#366f70"));
-    palette.setColor(QPalette::HighlightedText, Qt::white);
-    qApp->setPalette(palette);
-    qApp->setDoubleClickInterval(qBound(100, settings.value("input/doubleClickMs", 400).toInt(), 1000));
-    QColor accent(settings.value("appearance/accent", "#54d6b0").toString());
-    if (settings.value("appearance/followSystem", false).toBool()) {
-        QSettings windows("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\DWM", QSettings::NativeFormat);
-        const quint32 color = windows.value("ColorizationColor", 0xff54d6b0).toUInt();
-        accent = QColor::fromRgb(color & 0x00ffffff);
-    }
-    qApp->setFont(QFont(settings.value("appearance/font", "Microsoft YaHei UI").toString(), 10));
-    const QString style =
-        QStringLiteral(
-            "QWidget { color:#e8edf5; font-size:13px; }"
-            "QMainWindow,QDialog { background:#10151e; }"
-            "QToolTip { color:#e8edf5; background:#253043; border:1px solid #41506a; padding:6px; }"
-            "QLabel#heading { font-size:30px; font-weight:600; }"
-            "QLabel#muted { color:#92a0b5; }"
-            "QLabel#brand { font-size:23px; font-weight:600; color:%1; }"
-            "QFrame#sidebar { background:#171e2a; border-right:1px solid #283344; }"
-            "QPushButton,QToolButton { background:#232d3e; border:1px solid #354158; border-radius:6px; "
-            "padding:7px 12px; }"
-            "QPushButton:hover,QToolButton:hover { background:#2f3d54; border-color:%1; }"
-            "QPushButton:checked,QToolButton:checked,QPushButton#primary { background:%1; color:#10151e; "
-            "border-color:%1; font-weight:600; }"
-            "QPushButton:disabled,QToolButton:disabled { color:#657188; background:#1d2532; }"
-            "QLineEdit,QSpinBox,QDoubleSpinBox,QComboBox,QKeySequenceEdit,QPlainTextEdit { "
-            "background:#1a2332; border:1px solid #364359; border-radius:5px; padding:5px; "
-            "selection-background-color:#366f70; }"
-            "QComboBox QAbstractItemView { background:#1a2332; selection-background-color:#366f70; }"
-            "QListWidget,QTreeWidget,QScrollArea { background:#10151e; border:0; }"
-            "QListWidget::item { border-radius:7px; padding:8px; }"
-            "QListWidget::item:selected { background:#263f4a; border:1px solid %1; }"
-            "QMenu { background:#1b2433; border:1px solid #354158; padding:6px; }"
-            "QMenu::item { padding:7px 24px; border-radius:4px; }"
-            "QMenu::item:selected { background:#35455c; }"
-            "QMenu::separator { height:1px; background:#354158; margin:5px; }"
-            "QTabWidget::pane { border:1px solid #2c374a; }"
-            "QTabBar::tab { background:#1c2635; padding:10px 16px; }"
-            "QTabBar::tab:selected { background:#314458; }"
-            "QCheckBox { spacing:9px; padding:4px; }"
-            "QCheckBox::indicator { width:16px; height:16px; }"
-            "QStatusBar { background:#171e2a; color:#9aaac0; }"
-            "QSplitter::handle { background:#283344; }"
-            "QScrollBar:vertical { background:#141c28; width:10px; }"
-            "QScrollBar::handle:vertical { background:#3c4c65; min-height:24px; border-radius:5px; }")
-            .arg(accent.name());
-    QString scaledStyle;
-    int offset = 0;
-    auto matches = QRegularExpression("(\\d+)px").globalMatch(style);
-    while (matches.hasNext()) {
-        const auto match = matches.next();
-        scaledStyle += style.mid(offset, match.capturedStart() - offset);
-        scaledStyle += QString::number(uiPixels(match.captured(1).toInt())) + "px";
-        offset = match.capturedEnd();
-    }
-    scaledStyle += style.mid(offset);
-    qApp->setStyleSheet(scaledStyle);
+    Ui::applyLightAppearance(settings);
 }
 
 bool showSettings(Settings &settings, QWidget *parent) {
     QDialog dialog(parent);
+    dialog.setObjectName("settingsDialog");
     dialog.setWindowTitle(QStringLiteral("EasySnip · 设置"));
-    dialog.resize(QSize(uiPixels(760), uiPixels(720))
+    dialog.resize(QSize(uiPixels(960), uiPixels(760))
                       .boundedTo(QGuiApplication::primaryScreen()->availableGeometry().size() * 0.92));
     auto *layout = new QVBoxLayout(&dialog);
-    auto *tabs = new QTabWidget;
-    layout->addWidget(tabs);
+    layout->setContentsMargins(uiPixels(24), uiPixels(22), uiPixels(24), uiPixels(18));
+    layout->setSpacing(uiPixels(18));
+    auto *heading = new QLabel(QStringLiteral("设置"));
+    heading->setObjectName("heading");
+    layout->addWidget(heading);
+    auto *body = new QHBoxLayout;
+    body->setSpacing(uiPixels(20));
+    layout->addLayout(body, 1);
+    auto *navigation = new QListWidget;
+    navigation->setObjectName("settingsNavigation");
+    navigation->setFixedWidth(uiPixels(148));
+    navigation->setIconSize(QSize(uiPixels(18), uiPixels(18)));
+    navigation->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    body->addWidget(navigation);
+    auto *panel = new QFrame;
+    panel->setObjectName("settingsPanel");
+    auto *panelLayout = new QVBoxLayout(panel);
+    panelLayout->setContentsMargins(1, 1, 1, 1);
+    auto *pages = new QStackedWidget;
+    panelLayout->addWidget(pages);
+    body->addWidget(panel, 1);
+    QObject::connect(navigation, &QListWidget::currentRowChanged, pages, &QStackedWidget::setCurrentIndex);
     QVector<std::function<void()>> save;
-    auto page = [&](const QString &title) {
+    auto page = [&](const QString &title, const QString &icon, const QString &description) {
         auto *widget = new QWidget;
+        widget->setObjectName("settingsPage");
         auto *form = new QFormLayout(widget);
-        form->setContentsMargins(22, 20, 22, 20);
-        form->setSpacing(12);
+        form->setContentsMargins(uiPixels(24), uiPixels(22), uiPixels(24), uiPixels(24));
+        form->setHorizontalSpacing(uiPixels(20));
+        form->setVerticalSpacing(uiPixels(15));
+        form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        auto *titleLabel = new QLabel(title);
+        titleLabel->setObjectName("pageHeading");
+        form->addRow(titleLabel);
+        auto *note = new QLabel(description);
+        note->setObjectName("muted");
+        note->setWordWrap(true);
+        form->addRow(note);
         auto *scroll = new QScrollArea;
+        scroll->setFrameShape(QFrame::NoFrame);
         scroll->setWidgetResizable(true);
         scroll->setWidget(widget);
-        tabs->addTab(scroll, title);
+        pages->addWidget(scroll);
+        new QListWidgetItem(Ui::commandIcon(icon), title, navigation);
         return form;
     };
     auto check = [&](QFormLayout *form, const QString &text, const QString &key, bool fallback) {
@@ -193,13 +159,13 @@ bool showSettings(Settings &settings, QWidget *parent) {
         save.append([&, combo, key] { settings.set(key, combo->currentData()); });
     };
 
-    auto *general = page(QStringLiteral("常规"));
+    auto *general = page(QStringLiteral("常规"), "settings", QStringLiteral("启动方式、界面外观与托盘操作。"));
     check(general, QStringLiteral("开机启动"), "general/autostart", false);
     check(general, QStringLiteral("以管理员权限启动（下次启动时请求 UAC 确认）"), "runtime/administrator", false);
     check(general, QStringLiteral("显示托盘图标"), "general/tray", true);
     check(general, QStringLiteral("显示操作通知"), "general/notifications", true);
     check(general, QStringLiteral("跟随系统强调色"), "appearance/followSystem", false);
-    text(general, QStringLiteral("主题色 HEX"), "appearance/accent", "#54d6b0");
+    text(general, QStringLiteral("强调色 HEX"), "appearance/accent", "#0067c0");
     text(general, QStringLiteral("界面字体"), "appearance/font", "Microsoft YaHei UI");
     text(general, QStringLiteral("自定义托盘图标路径"), "appearance/icon", "");
     const QStringList actions{"capture", "history", "settings", "menu", "none"};
@@ -210,7 +176,7 @@ bool showSettings(Settings &settings, QWidget *parent) {
     choices(general, QStringLiteral("托盘中键"), "tray/middle", actions, labels, "none");
     choices(general, QStringLiteral("托盘右键"), "tray/right", actions, labels, "menu");
 
-    auto *capture = page(QStringLiteral("截图"));
+    auto *capture = page(QStringLiteral("截图"), "capture", QStringLiteral("调整选区、元素检测与取色体验。"));
     number(capture, QStringLiteral("默认延迟 / 秒"), "capture/delay", 0, 0, 120);
     check(capture, QStringLiteral("捕获鼠标指针"), "capture/cursor", false);
     check(capture, QStringLiteral("自动检测界面元素"), "capture/elements", false);
@@ -230,7 +196,7 @@ bool showSettings(Settings &settings, QWidget *parent) {
     text(capture, QStringLiteral("检测排除程序（分号分隔）"), "capture/excluded", "");
     check(capture, QStringLiteral("WASD 逐像素移动鼠标（含拖拽中）"), "input/wasd", true);
 
-    auto *shortcuts = page(QStringLiteral("快捷键"));
+    auto *shortcuts = page(QStringLiteral("快捷键"), "keyboard", QStringLiteral("配置全局按键、编辑器操作和屏幕触发角。"));
     check(shortcuts, QStringLiteral("启用全局快捷键"), "hotkeys/enabled", true);
     check(shortcuts, QStringLiteral("允许字母或数字单键快捷键"), "hotkeys/allowSimple", false);
     const QStringList keys{"capture", "last", "active", "history", "command"};
@@ -255,7 +221,7 @@ bool showSettings(Settings &settings, QWidget *parent) {
     choices(shortcuts, QStringLiteral("左下角"), "corners/bottomLeft", actions, labels, "none");
     choices(shortcuts, QStringLiteral("右下角"), "corners/bottomRight", actions, labels, "none");
 
-    auto *output = page(QStringLiteral("输出与存储"));
+    auto *output = page(QStringLiteral("输出与存储"), "folder", QStringLiteral("选择保存位置、输出格式和历史保留方式。"));
     auto *directory =
         text(output, QStringLiteral("快捷保存目录"), "output/directory", settings.outputDirectory());
     auto *browse = new QPushButton(QStringLiteral("选择保存目录"));
@@ -282,15 +248,18 @@ bool showSettings(Settings &settings, QWidget *parent) {
         new QLabel(QStringLiteral("高级配置位于 %1\n历史目录修改后重启生效，原目录中的记录仍可保留。")
                        .arg(settings.fileName()));
     note->setWordWrap(true);
+    note->setObjectName("muted");
     note->setTextInteractionFlags(Qt::TextSelectableByMouse);
     output->addRow(note);
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
     buttons->button(QDialogButtonBox::Save)->setText(QStringLiteral("保存设置"));
+    buttons->button(QDialogButtonBox::Save)->setObjectName("primary");
     buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
     layout->addWidget(buttons);
     QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    navigation->setCurrentRow(0);
     if (dialog.exec() != QDialog::Accepted)
         return false;
     for (const auto &write : save)

@@ -150,33 +150,33 @@ QImage gaussianBlur(const QImage &source, int radius) {
     return output;
 }
 
-namespace {
-QPainterPath effectPath(const Annotation &item) {
+QPainterPath Annotation::effectPath() const {
     QPainterPath path;
-    if (item.shape == 3 && !item.points.isEmpty()) {
-        path.moveTo(item.points.first());
-        for (int i = 1; i < item.points.size(); ++i)
-            path.lineTo(item.points[i]);
+    if (shape == 3 && !points.isEmpty()) {
+        path.moveTo(points.first());
+        for (int i = 1; i < points.size(); ++i)
+            path.lineTo(points[i]);
         QPainterPathStroker stroke;
-        stroke.setWidth(item.width);
+        stroke.setWidth(width);
         stroke.setCapStyle(Qt::RoundCap);
         stroke.setJoinStyle(Qt::RoundJoin);
         QPainterPath result = stroke.createStroke(path);
         result.setFillRule(Qt::WindingFill);
-        result.addEllipse(item.points.first(), item.width / 2, item.width / 2);
+        result.addEllipse(points.first(), width / 2, width / 2);
         return result;
     }
-    QRectF rect = item.rect.normalized();
-    if (item.shape == 2) {
-        const qreal size = qMin(rect.width(), rect.height());
-        rect.setSize(QSizeF(size, size));
+    QRectF area = rect.normalized();
+    if (shape == 2) {
+        const qreal size = qMin(area.width(), area.height());
+        area.setSize(QSizeF(size, size));
     }
-    if (item.shape == 1 || item.shape == 2)
-        path.addEllipse(rect);
+    if (shape == 1 || shape == 2)
+        path.addEllipse(area);
     else
-        path.addRect(rect);
+        path.addRect(area);
     return path;
 }
+namespace {
 void arrowHead(QPainter &painter, const QPointF &from, const QPointF &to, const Annotation &item) {
     const double angle = std::atan2(to.y() - from.y(), to.x() - from.x());
     const double length = qMax(12.0, item.width * 4);
@@ -205,7 +205,7 @@ QImage Document::render(bool frame) const {
         transform.translate(rect.center().x(), rect.center().y());
         transform.rotate(item.rotation);
         transform.translate(-rect.center().x(), -rect.center().y());
-        const QRect effectRegion = transform.map(effectPath(item)).boundingRect().toAlignedRect()
+        const QRect effectRegion = transform.map(item.effectPath()).boundingRect().toAlignedRect()
                                        .intersected(canvas.rect());
         QRect sampleRegion = effectRegion;
         if (item.tool == Tool::Magnify && !effectRegion.isEmpty()) {
@@ -255,8 +255,11 @@ QImage Document::render(bool frame) const {
             break;
         }
         case Tool::Eraser:
-            painter.setCompositionMode(QPainter::CompositionMode_Clear);
-            painter.fillPath(effectPath(item), Qt::transparent);
+            // Restore the source at the same image coordinates, including its original alpha.
+            painter.setClipPath(item.effectPath());
+            painter.resetTransform();
+            painter.setCompositionMode(QPainter::CompositionMode_Source);
+            painter.drawImage(QPoint(0, 0), image);
             break;
         case Tool::Mosaic:
         case Tool::Blur:
@@ -275,12 +278,12 @@ QImage Document::render(bool frame) const {
                 patch = gaussianBlur(patch, qRound(item.width * 2));
             else
                 patch = patch.scaled(region.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-            painter.setClipPath(effectPath(item));
+            painter.setClipPath(item.effectPath());
             painter.resetTransform();
             painter.drawImage(region.topLeft(), patch);
             if (item.tool == Tool::Magnify) {
                 painter.setTransform(transform);
-                painter.drawPath(effectPath(item));
+                painter.drawPath(item.effectPath());
             }
             break;
         }

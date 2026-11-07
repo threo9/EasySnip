@@ -1,0 +1,8 @@
+<RCC>
+  <qresource prefix="/theme">
+    <file alias="check.svg">theme/check.svg</file>
+    <file alias="check-dark.svg">theme/check-dark.svg</file>
+    <file alias="chevron-down.svg">theme/chevron-down.svg</file>
+    <file alias="chevron-up.svg">theme/chevron-up.svg</file>
+  </qresource>
+</RCC>

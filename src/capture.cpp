@@ -1,4 +1,5 @@
 #include "capture.h"
+#include "appearance.h"
 #include "editor.h"
 #include <QtWidgets>
 #include <QtConcurrent>
@@ -46,10 +47,10 @@ class CaptureBorder final : public QWidget {
   protected:
     void paintEvent(QPaintEvent *) override {
         QPainter painter(this);
-        painter.setPen(QPen(QColor("#54d6b0"), 1));
+        painter.setPen(QPen(Ui::accent(), 1));
         painter.setBrush(Qt::NoBrush);
         painter.drawRoundedRect(frame_.adjusted(-1, -1, 1, 1), radius_, radius_);
-        painter.setBrush(QColor("#54d6b0"));
+        painter.setBrush(Ui::accent());
         const int size = uiPixels(3);
         for (const auto &point : captureHandles(frame_))
             painter.drawRect(QRect(point - QPoint(size, size), QSize(size * 2, size * 2)));
@@ -66,117 +67,6 @@ const QVector<QVector<Tool>> &annotationToolGroups() {
     return groups;
 }
 
-QIcon toolIcon(Tool tool) {
-    QPixmap pixmap(uiPixels(24) * 2, uiPixels(24) * 2);
-    pixmap.fill(Qt::transparent);
-    QPainter painter(&pixmap);
-    painter.setRenderHint(QPainter::Antialiasing);
-    painter.scale(pixmap.width() / 24.0, pixmap.height() / 24.0);
-    painter.setPen(QPen(QColor("#e8edf5"), 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    switch (tool) {
-    case Tool::Select:
-        painter.drawPolygon(QPolygonF({{5, 3}, {6, 20}, {10, 15}, {14, 21}, {17, 19}, {13, 13}, {20, 12}}));
-        break;
-    case Tool::Rectangle:
-        painter.drawRect(QRectF(3, 5, 18, 14));
-        break;
-    case Tool::Ellipse:
-        painter.drawEllipse(QRectF(3, 5, 18, 14));
-        break;
-    case Tool::RoundedRectangle:
-        painter.drawRoundedRect(QRectF(3, 5, 18, 14), 4, 4);
-        break;
-    case Tool::Line:
-    case Tool::Arrow:
-        painter.drawLine(4, 20, 20, 4);
-        if (tool == Tool::Arrow)
-            painter.drawPolyline(QPolygonF({{10, 4}, {20, 4}, {20, 14}}));
-        break;
-    case Tool::Polyline:
-        painter.drawPolyline(QPolygonF({{3, 18}, {8, 8}, {14, 14}, {21, 4}}));
-        break;
-    case Tool::Pen:
-        painter.drawPolygon(QPolygonF({{4, 16}, {16, 4}, {20, 8}, {8, 20}, {3, 21}}));
-        painter.drawLine(13, 7, 17, 11);
-        break;
-    case Tool::Mosaic:
-        for (int y = 0; y < 3; ++y)
-            for (int x = 0; x < 3; ++x)
-                painter.fillRect(3 + x * 6, 3 + y * 6, 6, 6,
-                                 (x + y) % 2 ? QColor("#e8edf5") : QColor("#718198"));
-        break;
-    case Tool::Blur:
-        for (int i = 0; i < 4; ++i) {
-            painter.setPen(QPen(QColor(232, 237, 245, 70 + i * 50), 2));
-            painter.drawLine(4, 5 + i * 5, 20, 5 + i * 5);
-        }
-        break;
-    case Tool::Eraser:
-        painter.drawPolygon(QPolygonF({{3, 15}, {13, 4}, {21, 11}, {12, 21}, {9, 21}}));
-        painter.drawLine(8, 10, 16, 17);
-        break;
-    case Tool::Text:
-        painter.drawLine(4, 4, 20, 4);
-        painter.drawLine(12, 4, 12, 21);
-        painter.drawLine(8, 21, 16, 21);
-        break;
-    case Tool::Number: {
-        painter.drawEllipse(QRectF(2, 2, 20, 20));
-        QFont font = painter.font();
-        font.setPixelSize(15);
-        painter.setFont(font);
-        painter.drawText(QRect(2, 2, 20, 20), Qt::AlignCenter, "1");
-        break;
-    }
-    case Tool::Magnify:
-        painter.drawEllipse(QRectF(3, 3, 13, 13));
-        painter.drawLine(15, 15, 22, 22);
-        painter.drawLine(6, 9, 13, 9);
-        painter.drawLine(9, 6, 9, 13);
-        break;
-    }
-    painter.end();
-    pixmap.setDevicePixelRatio(2);
-    return QIcon(pixmap);
-}
-
-QIcon outputIcon(const QString &name) {
-    QPixmap pixmap(uiPixels(24) * 2, uiPixels(24) * 2);
-    pixmap.fill(Qt::transparent);
-    QPainter painter(&pixmap);
-    painter.setRenderHint(QPainter::Antialiasing);
-    painter.scale(pixmap.width() / 24.0, pixmap.height() / 24.0);
-    painter.setPen(QPen(QColor("#e8edf5"), 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    if (name == "copy") {
-        painter.drawRect(QRectF(7, 7, 14, 14));
-        painter.drawPolyline(QPolygonF({{16, 4}, {3, 4}, {3, 17}}));
-    } else if (name == "save-as") {
-        painter.drawRect(QRectF(3, 3, 18, 18));
-        painter.drawRect(QRectF(7, 3, 9, 6));
-        painter.drawRect(QRectF(7, 14, 10, 7));
-    } else if (name == "finish") {
-        painter.setPen(QPen(QColor("#54d6b0"), 2.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-        painter.drawPolyline(QPolygonF({{4, 12}, {10, 18}, {21, 5}}));
-    } else if (name == "cancel") {
-        painter.drawLine(5, 5, 19, 19);
-        painter.drawLine(5, 19, 19, 5);
-    } else if (name == "region") {
-        painter.setPen(QPen(QColor("#e8edf5"), 1.5, Qt::DashLine));
-        painter.drawRect(QRectF(3, 3, 18, 18));
-    } else {
-        if (name == "redo") {
-            painter.translate(24, 0);
-            painter.scale(-1, 1);
-        }
-        painter.drawPolyline(QPolygonF({{9, 4}, {3, 10}, {9, 16}}));
-        QPainterPath path(QPointF(3, 10));
-        path.cubicTo(17, 7, 23, 12, 20, 21);
-        painter.drawPath(path);
-    }
-    painter.end();
-    pixmap.setDevicePixelRatio(2);
-    return QIcon(pixmap);
-}
 } // namespace
 
 CaptureOverlay::CaptureOverlay(Native::Desktop desktop, Settings &settings, const QRect &initial)
@@ -206,8 +96,8 @@ CaptureOverlay::CaptureOverlay(Native::Desktop desktop, Settings &settings, cons
         update();
     });
     toolbar_ = new QFrame(this);
-    toolbar_->setStyleSheet("QFrame { background:#172131; border:1px solid #41516a; border-radius:8px; } "
-                            "QPushButton { padding:7px 10px; }");
+    toolbar_->setObjectName("captureControls");
+    Ui::addFloatingShadow(toolbar_);
     auto *layout = new QHBoxLayout(toolbar_);
     layout->setContentsMargins(8, 8, 8, 8);
     auto button = [&](const QString &label, const QString &tip, const std::function<void()> &callback) {
@@ -270,16 +160,7 @@ CaptureOverlay::CaptureOverlay(Native::Desktop desktop, Settings &settings, cons
 void CaptureOverlay::createEditorToolbar() {
     editorToolbar_ = new QFrame(this);
     editorToolbar_->setObjectName("captureEditorToolbar");
-    const QString toolbarStyle =
-        "QFrame#captureEditorToolbar { background:#172131; border:1px solid #41516a; border-radius:6px; }"
-        "QFrame#captureToolOptions { background:#172131; border:1px solid #41516a; border-radius:6px; }"
-        "QToolBar { background:transparent; border:0; spacing:2px; }"
-        "QToolButton { padding:5px; border:1px solid transparent; background:transparent; }"
-        "QToolButton:hover { background:#2f3d54; border-color:#54d6b0; }"
-        "QToolButton:checked { background:#335c59; border-color:#54d6b0; }"
-        "QToolButton::menu-button { background:transparent; border:0; border-left:1px solid #41516a; width:12px; }"
-        "QToolBar::separator { background:#41516a; width:1px; margin:5px; }";
-    editorToolbar_->setStyleSheet(toolbarStyle);
+    Ui::addFloatingShadow(editorToolbar_);
     auto *layout = new QVBoxLayout(editorToolbar_);
     layout->setContentsMargins(6, 6, 6, 6);
     layout->setSpacing(4);
@@ -311,7 +192,7 @@ void CaptureOverlay::createEditorToolbar() {
         if (group.first() == Tool::Arrow)
             button->setObjectName("captureLineToolButton");
         for (Tool tool : group) {
-            auto *action = new QAction(toolIcon(tool), toolName(tool), tools_);
+            auto *action = new QAction(Ui::toolIcon(tool), toolName(tool), tools_);
             if (tool == Tool::Line || tool == Tool::Arrow)
                 action->setToolTip(toolName(tool) + QStringLiteral(" · 拖动两端调整 · Tab 切换"));
             action->setObjectName("captureTool" + toolKey(tool));
@@ -326,18 +207,18 @@ void CaptureOverlay::createEditorToolbar() {
     }
     connect(tools_, &QActionGroup::triggered, this, &CaptureOverlay::selectTool);
     bar->addSeparator();
-    undo_ = bar->addAction(outputIcon("undo"), QStringLiteral("撤销 · Ctrl+Z"), this, [this] {
+    undo_ = bar->addAction(Ui::commandIcon("undo"), QStringLiteral("撤销 · Ctrl+Z"), this, [this] {
         if (canvas_)
             canvas_->undo();
     });
-    redo_ = bar->addAction(outputIcon("redo"), QStringLiteral("重做 · Ctrl+Y"), this, [this] {
+    redo_ = bar->addAction(Ui::commandIcon("redo"), QStringLiteral("重做 · Ctrl+Y"), this, [this] {
         if (canvas_)
             canvas_->redo();
     });
     bar = outputTools_;
-    bar->addAction(outputIcon("cancel"), QStringLiteral("取消 · Esc"), this, &CaptureOverlay::cancel);
+    bar->addAction(Ui::commandIcon("cancel"), QStringLiteral("取消 · Esc"), this, &CaptureOverlay::cancel);
     auto output = [this, bar](const QString &label, const QString &name, const QString &key) {
-        auto *action = bar->addAction(outputIcon(name), label, this, [this, name] {
+        auto *action = bar->addAction(Ui::commandIcon(name), label, this, [this, name] {
             const bool quick = name == "save-as" && QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier);
             requestOutput(quick ? "save" : name);
         });
@@ -354,7 +235,9 @@ void CaptureOverlay::createEditorToolbar() {
     connect(quickSaveKey, &QShortcut::activated, this, [this] { requestOutput("save"); });
     output(QStringLiteral("完成 · Enter"), "finish", "Ctrl+Return");
     auto *more = new QToolButton;
-    more->setText(QStringLiteral("更多"));
+    more->setObjectName("captureMore");
+    more->setIcon(Ui::commandIcon("more"));
+    more->setIconSize(bar->iconSize());
     more->setToolTip(QStringLiteral("选区设置与更多输出"));
     more->setPopupMode(QToolButton::InstantPopup);
     more->setFocusPolicy(Qt::NoFocus);
@@ -389,20 +272,20 @@ void CaptureOverlay::createEditorToolbar() {
 
     styleBar_ = new QFrame(this);
     styleBar_->setObjectName("captureToolOptions");
-    styleBar_->setStyleSheet(toolbarStyle);
+    Ui::addFloatingShadow(styleBar_);
     auto *styleLayout = new QVBoxLayout(styleBar_);
     styleLayout->setContentsMargins(6, 6, 6, 6);
     styleLayout->setSpacing(4);
-    auto *style = new QHBoxLayout;
+    auto *style = new QBoxLayout(QBoxLayout::LeftToRight);
+    variantLayout_ = style;
     styleLayout->addLayout(style);
     style->setContentsMargins(4, 0, 4, 0);
-    toolVariant_ = new QComboBox;
+    toolVariant_ = new OptionStrip;
     toolVariant_->setObjectName("captureToolVariant");
     toolVariant_->setFocusPolicy(Qt::NoFocus);
     toolVariant_->setToolTip(QStringLiteral("具体形状 / 线条样式"));
     style->addWidget(toolVariant_);
-    connect(toolVariant_, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
-        const Tool tool = Tool(toolVariant_->itemData(index).toInt());
+    auto changeVariant = [this](Tool tool) {
         if (canvas_ && canvas_->selectedIndex() >= 0) {
             auto next = canvas_->style();
             next.tool = tool;
@@ -411,15 +294,33 @@ void CaptureOverlay::createEditorToolbar() {
             findChild<QAction *>("captureTool" + toolKey(tool))->trigger();
         if (canvas_)
             canvas_->setFocus();
+    };
+    connect(toolVariant_, &OptionStrip::activated, this, [this, changeVariant](int index) {
+        changeVariant(Tool(toolVariant_->itemData(index).toInt()));
     });
-    effectShape_ = new QComboBox;
+    lineType_ = new LineTypeButton;
+    lineType_->setObjectName("captureLineTypeButton");
+    style->addWidget(lineType_);
+    connect(lineType_, &LineTypeButton::toolClicked, this, changeVariant);
+    effectShape_ = new OptionStrip;
     effectShape_->setObjectName("captureEffectShape");
     effectShape_->setFocusPolicy(Qt::NoFocus);
     effectShape_->setToolTip(QStringLiteral("作用形状"));
-    effectShape_->addItems({QStringLiteral("矩形区域"), QStringLiteral("椭圆区域"),
-                            QStringLiteral("圆形区域"), QStringLiteral("画笔轨迹")});
+    effectShape_->addItem(Ui::toolIcon(Tool::Rectangle), QStringLiteral("矩形区域"), 0);
+    effectShape_->addItem(Ui::toolIcon(Tool::Ellipse), QStringLiteral("椭圆区域"), 1);
+    QPixmap circleIcon(uiPixels(20) * 2, uiPixels(20) * 2);
+    circleIcon.fill(Qt::transparent);
+    QPainter circlePainter(&circleIcon);
+    circlePainter.setRenderHint(QPainter::Antialiasing);
+    circlePainter.scale(circleIcon.width() / 20.0, circleIcon.height() / 20.0);
+    circlePainter.setPen(QPen(QColor("#303030"), 1.5));
+    circlePainter.drawEllipse(QRectF(3, 3, 14, 14));
+    circlePainter.end();
+    circleIcon.setDevicePixelRatio(2);
+    effectShape_->addItem(QIcon(circleIcon), QStringLiteral("圆形区域"), 2);
+    effectShape_->addItem(Ui::toolIcon(Tool::Pen), QStringLiteral("画笔轨迹"), 3);
     style->addWidget(effectShape_);
-    connect(effectShape_, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
+    connect(effectShape_, &OptionStrip::activated, this, [this](int index) {
         if (canvas_) {
             auto next = canvas_->style();
             next.shape = index;
@@ -444,10 +345,71 @@ void CaptureOverlay::createEditorToolbar() {
             syncStyle();
         }
     });
-    auto *options = new QPushButton(QStringLiteral("样式…"));
-    style->addWidget(options);
     style->addStretch();
-    connect(options, &QPushButton::clicked, this, &CaptureOverlay::editStyle);
+    auto choiceRow = [&](const QString &label, const QString &name, const QStringList &labels, OptionStrip *&strip) {
+        auto *group = new QWidget;
+        auto *row = new QHBoxLayout(group);
+        row->setContentsMargins(4, 0, 4, 0);
+        row->setSpacing(uiPixels(8));
+        row->addWidget(new QLabel(label));
+        strip = new OptionStrip;
+        strip->setObjectName(name);
+        strip->addItems(labels);
+        row->addWidget(strip);
+        row->addStretch();
+        styleLayout->addWidget(group);
+        return group;
+    };
+    lineOptions_ = choiceRow(QStringLiteral("线型"), "captureLineStyle", {}, lineStyle_);
+    lineStyle_->addItem(Ui::lineStyleIcon(false), QStringLiteral("实线"), int(Qt::SolidLine));
+    lineStyle_->addItem(Ui::lineStyleIcon(true), QStringLiteral("虚线"), int(Qt::DashLine));
+    styleLayout->removeWidget(lineOptions_);
+    style->insertWidget(style->indexOf(color_), lineOptions_);
+    arrowOptions_ = choiceRow(QStringLiteral("箭头"), "captureArrowStyle",
+        {QStringLiteral("单向"), QStringLiteral("双向"), QStringLiteral("反向"), QStringLiteral("实心")}, arrowStyle_);
+    fillOptions_ = choiceRow(QStringLiteral("填充"), "captureFillMode", {}, fillMode_);
+    fillMode_->addItem(Ui::fillModeIcon(false), QStringLiteral("空心"), 0);
+    fillMode_->addItem(Ui::fillModeIcon(true), QStringLiteral("填充"), 1);
+    fillColor_ = new QPushButton(QStringLiteral("填充颜色…"));
+    fillColor_->setObjectName("captureFillColor");
+    static_cast<QHBoxLayout *>(fillOptions_->layout())->insertWidget(2, fillColor_);
+    auto changeChoice = [this](OptionStrip *strip, int Annotation::*member, int offset) {
+        connect(strip, &OptionStrip::activated, this, [this, member, offset](int index) {
+            if (!canvas_)
+                return;
+            auto next = canvas_->style();
+            next.*member = index + offset;
+            canvas_->setStyle(next);
+            canvas_->setFocus();
+        });
+    };
+    changeChoice(lineStyle_, &Annotation::lineStyle, 1);
+    changeChoice(arrowStyle_, &Annotation::arrowStyle, 0);
+    connect(fillMode_, &OptionStrip::activated, this, [this](int index) {
+        if (!canvas_)
+            return;
+        auto next = canvas_->style();
+        if (index == 0)
+            next.fill = Qt::transparent;
+        else if (next.fill.alpha() == 0)
+            next.fill = next.color;
+        canvas_->setStyle(next);
+        canvas_->setFocus();
+    });
+    auto pickColor = [this](QPushButton *button, QColor Annotation::*member) {
+        connect(button, &QPushButton::clicked, this, [this, member] {
+            if (!canvas_)
+                return;
+            auto next = canvas_->style();
+            const QColor chosen = QColorDialog::getColor(next.*member, this, QStringLiteral("颜色与透明度"),
+                                                         QColorDialog::ShowAlphaChannel);
+            if (chosen.isValid()) {
+                next.*member = chosen;
+                canvas_->setStyle(next);
+            }
+        });
+    };
+    pickColor(fillColor_, &Annotation::fill);
     strengthLayout_ = new QBoxLayout(QBoxLayout::LeftToRight);
     strengthLayout_->setContentsMargins(4, 0, 4, 0);
     strengthLayout_->setSpacing(uiPixels(12));
@@ -494,6 +456,37 @@ void CaptureOverlay::createEditorToolbar() {
             canvas_->setStyle(next);
         }
     });
+    auto detailSlider = [&](const QString &label, const QString &name, int minimum, int maximum,
+                            double Annotation::*member, ValueSlider *&slider) {
+        auto *group = new QWidget;
+        auto *row = new QHBoxLayout(group);
+        row->setContentsMargins(4, 0, 4, 0);
+        row->addWidget(new QLabel(label));
+        slider = new ValueSlider(minimum, maximum);
+        slider->setObjectName(name);
+        slider->setFixedWidth(uiPixels(160));
+        row->addWidget(slider);
+        row->addStretch();
+        styleLayout->addWidget(group);
+        connect(slider, &ValueSlider::valueChanged, this, [this, member](double value) {
+            if (!canvas_)
+                return;
+            auto next = canvas_->style();
+            next.*member = value;
+            canvas_->setStyle(next);
+        });
+        connect(slider, &ValueSlider::editingStarted, this, [this] { if (canvas_) canvas_->beginStyleChange(); });
+        connect(slider, &ValueSlider::editingFinished, this, [this] { if (canvas_) canvas_->endStyleChange(); });
+        return group;
+    };
+    outlineOptions_ = detailSlider(QStringLiteral("描边"), "captureOutlineWidth", 0, 20,
+                                  &Annotation::outlineWidth, outlineWidth_);
+    outlineColor_ = new QPushButton(QStringLiteral("描边颜色…"));
+    outlineColor_->setObjectName("captureOutlineColor");
+    static_cast<QHBoxLayout *>(outlineOptions_->layout())->insertWidget(2, outlineColor_);
+    pickColor(outlineColor_, &Annotation::outline);
+    rotationOptions_ = detailSlider(QStringLiteral("旋转"), "captureRotation", -360, 360,
+                                   &Annotation::rotation, rotation_);
     styleBar_->hide();
     editorToolbar_->hide();
 }
@@ -555,20 +548,35 @@ void CaptureOverlay::syncStyle() {
                        context != Tool::Eraser && context != Tool::Magnify;
     const bool font = context == Tool::Text || context == Tool::Number;
     const bool width = context != Tool::Text && context != Tool::Magnify;
+    const bool lineType = context == Tool::Line || context == Tool::Arrow;
+    lineType_->setVisible(lineType);
+    lineType_->setTool(context);
     const QSignalBlocker widthBlock(strokeWidth_), fontBlock(fontSize_), opacityBlock(opacity_), variantBlock(toolVariant_),
-        shapeBlock(effectShape_);
+        shapeBlock(effectShape_), lineBlock(lineStyle_), arrowBlock(arrowStyle_), fillBlock(fillMode_),
+        outlineBlock(outlineWidth_), rotationBlock(rotation_);
     for (const auto &group : annotationToolGroups())
         if (group.contains(context)) {
             if (toolVariant_->count() != group.size() ||
                 toolVariant_->itemData(0).toInt() != int(group.first())) {
                 toolVariant_->clear();
                 for (Tool tool : group)
-                    toolVariant_->addItem(toolIcon(tool), toolName(tool), int(tool));
+                    toolVariant_->addItem(Ui::toolIcon(tool), toolName(tool), int(tool));
             }
             toolVariant_->setCurrentIndex(toolVariant_->findData(int(context)));
-            toolVariant_->setVisible(group.size() > 1);
+            toolVariant_->setVisible(group.size() > 1 && !lineType);
             break;
         }
+    const bool shape = context == Tool::Rectangle || context == Tool::Ellipse || context == Tool::RoundedRectangle;
+    lineOptions_->setVisible(shape || isLineTool(context) || context == Tool::Pen);
+    arrowOptions_->setVisible(context == Tool::Arrow);
+    fillOptions_->setVisible(shape || context == Tool::Text);
+    outlineOptions_->setVisible(context == Tool::Text);
+    rotationOptions_->setVisible(selected && !isLineTool(context) && context != Tool::Eraser);
+    lineStyle_->setCurrentIndex(lineStyle_->findData(style.lineStyle));
+    arrowStyle_->setCurrentIndex(style.arrowStyle);
+    fillMode_->setCurrentIndex(style.fill.alpha() == 0 ? 0 : 1);
+    outlineWidth_->setValue(style.outlineWidth);
+    rotation_->setValue(style.rotation);
     effectShape_->setVisible(isEffectTool(context));
     effectShape_->setCurrentIndex(style.shape);
     color_->setVisible(color);
@@ -592,62 +600,6 @@ void CaptureOverlay::syncStyle() {
         action->setChecked(!selecting_ && action->data().toInt() == int(canvas_->tool()));
     if (editorToolbar_->isVisible())
         placeToolbar();
-}
-
-void CaptureOverlay::editStyle() {
-    if (!canvas_)
-        return;
-    auto next = canvas_->style();
-    QDialog dialog(this);
-    dialog.setWindowTitle(QStringLiteral("标注样式"));
-    QFormLayout form(&dialog);
-    auto colorButton = [&](const QString &label, QColor &value) {
-        auto *button = new QPushButton(value.name(QColor::HexArgb), &dialog);
-        form.addRow(label, button);
-        connect(button, &QPushButton::clicked, &dialog, [button, &value, &dialog] {
-            const QColor color = QColorDialog::getColor(value, &dialog, QStringLiteral("颜色与透明度"),
-                                                         QColorDialog::ShowAlphaChannel);
-            if (color.isValid()) {
-                value = color;
-                button->setText(color.name(QColor::HexArgb));
-            }
-        });
-    };
-    colorButton(QStringLiteral("颜色"), next.color);
-    colorButton(QStringLiteral("填充"), next.fill);
-    colorButton(QStringLiteral("文字描边"), next.outline);
-    ValueSlider outlineWidth(0, 20);
-    outlineWidth.setValue(qRound(next.outlineWidth));
-    form.addRow(QStringLiteral("描边宽度"), &outlineWidth);
-    ValueSlider rotation(-360, 360, 1, 0, QStringLiteral("°"));
-    rotation.setValue(next.rotation);
-    rotation.setEnabled(!isLineTool(canvas_->selectedIndex() >= 0 ? next.tool : canvas_->tool()));
-    form.addRow(QStringLiteral("旋转"), &rotation);
-    QComboBox line, shape, arrow;
-    line.addItems({QStringLiteral("实线"), QStringLiteral("虚线"), QStringLiteral("点线")});
-    line.setCurrentIndex(next.lineStyle - 1);
-    form.addRow(QStringLiteral("线型"), &line);
-    shape.addItems({QStringLiteral("矩形区域"), QStringLiteral("椭圆区域"), QStringLiteral("圆形区域"),
-                    QStringLiteral("画笔轨迹")});
-    shape.setCurrentIndex(next.shape);
-    form.addRow(QStringLiteral("效果区域"), &shape);
-    arrow.addItems({QStringLiteral("单向开放"), QStringLiteral("双向"), QStringLiteral("反向"),
-                    QStringLiteral("实心箭头")});
-    arrow.setCurrentIndex(next.arrowStyle);
-    form.addRow(QStringLiteral("箭头"), &arrow);
-    QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-    form.addRow(&buttons);
-    connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    if (dialog.exec() == QDialog::Accepted) {
-        next.outlineWidth = outlineWidth.value();
-        next.rotation = rotation.value();
-        next.lineStyle = line.currentIndex() + 1;
-        next.shape = shape.currentIndex();
-        next.arrowStyle = arrow.currentIndex();
-        canvas_->setStyle(next);
-        syncStyle();
-    }
 }
 
 QRect CaptureOverlay::selectedGlobal() const {
@@ -917,6 +869,9 @@ void CaptureOverlay::placeToolbar() {
     y = qBound(screen.top(), y, qMax(screen.top(), screen.bottom() - editorToolbar_->height() + 1));
     editorToolbar_->move(x, y);
     if (styleBar_->isVisible()) {
+        variantLayout_->setDirection(QBoxLayout::LeftToRight);
+        if (variantLayout_->sizeHint().width() + 20 > screen.width())
+            variantLayout_->setDirection(QBoxLayout::TopToBottom);
         strengthLayout_->setDirection(QBoxLayout::LeftToRight);
         if (strengthLayout_->sizeHint().width() + 20 > screen.width())
             strengthLayout_->setDirection(QBoxLayout::TopToBottom);
@@ -976,7 +931,7 @@ void CaptureOverlay::paintEvent(QPaintEvent *) {
     if (!target.isEmpty())
         hole.addRoundedRect(target, radius_, radius_);
     painter.fillPath(mask.subtracted(hole), QColor(4, 10, 20, 140));
-    painter.setPen(QPen(QColor("#54d6b0"), 1));
+    painter.setPen(QPen(Ui::accent(), 1));
     painter.setBrush(Qt::NoBrush);
     if (!target.isEmpty()) {
         painter.drawRoundedRect(target.adjusted(-1, -1, 1, 1), radius_, radius_);
@@ -986,20 +941,26 @@ void CaptureOverlay::paintEvent(QPaintEvent *) {
                                  .arg(target.x() + desktop_.geometry.x())
                                  .arg(target.y() + desktop_.geometry.y())
                                  .arg(typed_.isEmpty() ? "" : "   " + typed_);
-        const QRect label(target.left(), qMax(5, target.top() - 33),
-                          qMax(240, painter.fontMetrics().horizontalAdvance(text) + 20), 27);
-        painter.fillRect(label, QColor("#172131"));
-        painter.setPen(Qt::white);
-        painter.drawText(label.adjusted(8, 0, -6, 0), Qt::AlignVCenter, text);
+        const QRect label(target.left(), qMax(uiPixels(5), target.top() - uiPixels(35)),
+                          qMax(uiPixels(240), painter.fontMetrics().horizontalAdvance(text) + uiPixels(20)), uiPixels(28));
+        painter.setPen(QPen(QColor("#d6d6d6"), 1));
+        painter.setBrush(QColor("#fbfbfb"));
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.drawRoundedRect(label, uiPixels(5), uiPixels(5));
+        painter.setPen(QColor("#242424"));
+        painter.drawText(label.adjusted(uiPixels(10), 0, -uiPixels(6), 0), Qt::AlignVCenter, text);
     }
     QRect currentScreen = rect();
     for (const auto &screen : desktop_.screens)
         if (screen.contains(QCursor::pos()))
             currentScreen = screen.translated(-desktop_.geometry.topLeft());
-    const QRect help(currentScreen.left() + 20, currentScreen.top() + 20,
-                     qMin(1000, currentScreen.width() - 40), 36);
-    painter.fillRect(help, QColor(16, 25, 39, 225));
-    painter.setPen(Qt::white);
+    const QRect help(currentScreen.left() + uiPixels(20), currentScreen.top() + uiPixels(20),
+                     qMin(uiPixels(1000), currentScreen.width() - uiPixels(40)), uiPixels(38));
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(QColor("#d6d6d6"), 1));
+    painter.setBrush(QColor(251, 251, 251, 245));
+    painter.drawRoundedRect(help, uiPixels(7), uiPixels(7));
+    painter.setPen(QColor("#343434"));
     const QString helpText = selecting_
         ? QStringLiteral("拖动空白处移动选区 · 边框缩放 · Ctrl+D 尺寸 · Enter 复制 · , . 历史 · Esc 取消")
         : QStringLiteral("拖动边框调整范围 · Shift 约束 · 1/2 粗细 · 右键结束编辑 · Enter 复制 · Esc 取消");
@@ -1021,7 +982,9 @@ void CaptureOverlay::paintEvent(QPaintEvent *) {
         const QRect lens(position, QSize(side * zoom, side * zoom));
         const QImage patch =
             desktop_.image.copy(QRect(mouse_ - QPoint(side / 2, side / 2), QSize(side, side)));
-        painter.fillRect(QRect(position, box), QColor("#172131"));
+        painter.setPen(QPen(QColor("#d6d6d6"), 1));
+        painter.setBrush(QColor("#fbfbfb"));
+        painter.drawRoundedRect(QRect(position, box), uiPixels(6), uiPixels(6));
         painter.save();
         if (settings_.value("magnifier/style", "square").toString() == "round") {
             QPainterPath circle;
@@ -1039,7 +1002,7 @@ void CaptureOverlay::paintEvent(QPaintEvent *) {
         painter.setPen(QPen(QColor("#ff536b"), 2));
         painter.drawRect(QRect(position + QPoint(side / 2 * zoom, side / 2 * zoom), QSize(zoom, zoom)));
         painter.restore();
-        painter.setPen(Qt::white);
+        painter.setPen(QColor("#242424"));
         const QString value =
             colorText(desktop_.image.pixelColor(mouse_), settings_.value("color/format", "HEX").toString(),
                       settings_.value("color/uppercase", true).toBool());

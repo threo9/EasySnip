@@ -1,4 +1,5 @@
 #include "application.h"
+#include "appearance.h"
 #include <QtWidgets>
 #include <QtTest>
 #include <QtConcurrent>
@@ -72,6 +73,7 @@ int runSelfTests(const QString &directory, bool native) {
     settings.set("hotkeys/enabled", false);
     settings.set("capture/superDrag", false);
     settings.set("magnifier/enabled", false);
+    settings.set("appearance/uiScale", 1.0);
     applyAppearance(settings);
     QJsonArray checks;
     int failures = 0;
@@ -116,7 +118,101 @@ int runSelfTests(const QString &directory, bool native) {
     eraser.tool = Tool::Eraser;
     eraser.rect = QRectF(10, 10, 50, 50);
     erased.annotations.append(eraser);
-    check("eraser alpha", qAlpha(erased.render().pixel(30, 30)) == 0);
+    check("eraser preserves original screenshot pixels", erased.render().pixelColor(30, 30) == erased.image.pixelColor(30, 30));
+    {
+        Document source;
+        source.image = QImage(120, 100, QImage::Format_ARGB32_Premultiplied);
+        for (int y = 0; y < 100; ++y)
+            for (int x = 0; x < 120; ++x)
+                source.image.setPixelColor(x, y, QColor(x * 2, y * 2, (x + y) % 2 ? 230 : 40));
+        Annotation mark;
+        mark.rect = QRectF(10, 10, 100, 80);
+        mark.color = Qt::red;
+        mark.fill = Qt::red;
+        mark.width = 10;
+        mark.text = "Text";
+        Annotation erase;
+        erase.tool = Tool::Eraser;
+        erase.rect = source.image.rect();
+        for (Tool tool : {Tool::Rectangle, Tool::Ellipse, Tool::RoundedRectangle, Tool::Line, Tool::Arrow,
+                          Tool::Polyline, Tool::Pen, Tool::Text, Tool::Number, Tool::Mosaic, Tool::Blur, Tool::Magnify}) {
+            Document modified = source;
+            mark.tool = tool;
+            mark.points = isLineTool(tool) || tool == Tool::Pen ? QVector<QPointF>{{20, 20}, {90, 70}} : QVector<QPointF>();
+            modified.annotations = {mark};
+            const QImage before = modified.render();
+            modified.annotations.append(erase);
+            check("eraser restores source under tool " + toolKey(tool), before != source.image && modified.render() == source.image);
+        }
+        mark.tool = Tool::Rectangle;
+        mark.points.clear();
+        source.annotations = {mark};
+        const QImage marked = source.render();
+        erase.shape = 3;
+        erase.width = 16;
+        erase.points = {{20, 40}, {90, 40}};
+        source.annotations.append(erase);
+        const QImage partial = source.render();
+        check("eraser restores only its brush path", partial.pixelColor(60, 40) == source.image.pixelColor(60, 40) &&
+              partial.pixelColor(60, 70) == marked.pixelColor(60, 70));
+        check("eraser history JSON retains restored pixels", Document::fromJson(source.toJson(), source.image).render() == partial);
+        source.annotations.last().shape = 0;
+        source.annotations.last().points.clear();
+        source.annotations.last().rect = QRectF(40, 20, 20, 60);
+        source.annotations.last().rotation = 90;
+        const QImage rotated = source.render();
+        check("rotated eraser samples unrotated source coordinates", rotated.pixelColor(70, 50) == source.image.pixelColor(70, 50) &&
+              rotated.pixelColor(50, 25) == marked.pixelColor(50, 25));
+        Document transparent = source;
+        transparent.image.fill(QColor(50, 100, 150, 100));
+        transparent.image.setPixelColor(60, 40, Qt::transparent);
+        erase.shape = 0;
+        erase.points.clear();
+        transparent.annotations = {mark, erase};
+        check("eraser preserves original transparency", transparent.render() == transparent.image);
+        source.annotations = {mark};
+        Settings eraseSettings(temporary.path() + "/eraser");
+        AnnotationCanvas canvas(source, eraseSettings);
+        canvas.setAttribute(Qt::WA_DontShowOnScreen);
+        canvas.show();
+        canvas.setTool(Tool::Eraser);
+        check("eraser defaults to freehand brush", canvas.style().shape == 3);
+        auto eraseStyle = canvas.style();
+        eraseStyle.width = 20;
+        canvas.setStyle(eraseStyle);
+        QTest::mousePress(&canvas, Qt::LeftButton, {}, {20, 40});
+        QMouseEvent stroke(QEvent::MouseMove, QPointF(90, 40), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&canvas, &stroke);
+        QTest::mouseRelease(&canvas, Qt::LeftButton, {}, {90, 40});
+        const QImage after = canvas.document().render();
+        check("eraser starts over existing filled annotations", canvas.document().annotations.size() == 2 &&
+              after.pixelColor(60, 40) == source.image.pixelColor(60, 40) && canvas.selectedIndex() == -1);
+        canvas.undo();
+        check("undo eraser restores annotations", canvas.document().render() == marked);
+        canvas.redo();
+        check("redo eraser restores stroke without selecting mask", canvas.document().render() == after && canvas.selectedIndex() == -1);
+        QTest::mouseClick(&canvas, Qt::LeftButton, {}, {40, 70});
+        check("eraser supports repeated strokes over annotations", canvas.document().annotations.size() == 3 &&
+              canvas.document().render().pixelColor(40, 70) == source.image.pixelColor(40, 70));
+        QSignalSpy eraserCopy(&canvas, &AnnotationCanvas::imageCopyRequested);
+        QTest::mouseDClick(&canvas, Qt::LeftButton, {}, {70, 70});
+        QTest::mouseRelease(&canvas, Qt::LeftButton, {}, {70, 70});
+        check("eraser double click keeps editing instead of outputting", eraserCopy.isEmpty() &&
+              canvas.document().render().pixelColor(70, 70) == source.image.pixelColor(70, 70));
+        const int beforePen = canvas.document().annotations.size();
+        canvas.setTool(Tool::Pen);
+        QTest::mouseClick(&canvas, Qt::LeftButton, {}, {60, 40});
+        check("new annotations can be drawn over erased areas", canvas.document().annotations.size() == beforePen + 1 &&
+              canvas.document().annotations.last().tool == Tool::Pen &&
+              canvas.document().render().pixelColor(60, 40) != source.image.pixelColor(60, 40));
+        Library erasedHistory(eraseSettings);
+        const QString erasedId = erasedHistory.add(canvas.document());
+        check("eraser survives history save and reload", !erasedId.isEmpty() &&
+              erasedHistory.document(erasedId).render() == canvas.document().render());
+        canvas.document().render().save(QDir(directory).filePath("eraser-restores-source.png"));
+        canvas.hide();
+    }
+
     {
         check("remaining tool serialization IDs stay compatible", int(Tool::Pen) == 7 &&
               int(Tool::Mosaic) == 9 && int(Tool::Blur) == 10 && int(Tool::Eraser) == 11 &&
@@ -346,7 +442,7 @@ int runSelfTests(const QString &directory, bool native) {
             editCanvas.setTool(tool);
             drag(&editCanvas, {250, 100}, {100, 220});
             const QImage selected = editCanvas.grab().toImage();
-            const QColor handle("#54d6b0");
+            const QColor handle = Ui::accent();
             check(label + " shows only endpoint handles",
                   selected.pixelColor(250, 100) == handle && selected.pixelColor(100, 220) == handle &&
                   selected.pixelColor(100, 100) != handle && selected.pixelColor(250, 220) != handle);
@@ -474,7 +570,7 @@ int runSelfTests(const QString &directory, bool native) {
         const Annotation stroke = editCanvas.document().annotations.first();
         check("transparent pen direction constraint", stroke.tool == Tool::Pen && stroke.color.alpha() == 100 &&
               stroke.points.size() >= 2 && qAbs(stroke.points.last().y() - stroke.points.first().y()) < 0.01);
-        for (Tool effect : {Tool::Mosaic, Tool::Blur, Tool::Eraser}) {
+        for (Tool effect : {Tool::Mosaic, Tool::Blur}) {
             Document effectDocument;
             effectDocument.image = QImage(100, 100, QImage::Format_ARGB32);
             effectDocument.image.fill(Qt::white);
@@ -836,7 +932,8 @@ int runSelfTests(const QString &directory, bool native) {
         auto *lineButton = inlineOverlay.findChild<QToolButton *>("captureLineToolButton");
         auto *lineAction = inlineOverlay.findChild<QAction *>("captureTool" + toolKey(Tool::Line));
         auto *arrowAction = inlineOverlay.findChild<QAction *>("captureTool" + toolKey(Tool::Arrow));
-        auto *toolVariant = inlineOverlay.findChild<QComboBox *>("captureToolVariant");
+        auto *toolVariant = inlineOverlay.findChild<OptionStrip *>("captureToolVariant");
+        auto *lineType = inlineOverlay.findChild<LineTypeButton *>("captureLineTypeButton");
         check("inline line primary button has no secondary menu",
               lineButton && !lineButton->menu() && lineAction && arrowAction);
         bool polylineDirect = false;
@@ -846,11 +943,29 @@ int runSelfTests(const QString &directory, bool native) {
         check("inline polyline remains separately available", polylineDirect);
         if (inlineCanvas && lineButton && lineAction && arrowAction) {
             lineAction->trigger();
-            check("inline secondary line menu contains exactly line and arrow styles",
-                  toolVariant && toolVariant->isVisible() && toolVariant->count() == 2 &&
-                  toolVariant->findData(int(Tool::Line)) >= 0 && toolVariant->findData(int(Tool::Arrow)) >= 0);
+            check("inline line mode uses one cycling icon button",
+                  lineType && lineType->isVisible() && toolVariant && !toolVariant->isVisible() &&
+                  lineType->toolButtonStyle() == Qt::ToolButtonIconOnly && !lineType->menu());
+            const QImage lineIcon = lineType->icon().pixmap(QSize(64, 64)).toImage();
+            check("line mode shows a dark line and a gray arrow", lineIcon.pixelColor(32, 46).lightness() < 60 &&
+                  lineIcon.pixelColor(32, 22).lightness() > 140);
+            lineType->grab().save(QDir(directory).filePath("line-type-line.png"));
             check("inline line style updates the shared button",
                   inlineCanvas->tool() == Tool::Line && lineButton->defaultAction() == lineAction && lineAction->isChecked());
+            lineType->click();
+            check("inline mode button switches from line to arrow", inlineCanvas->tool() == Tool::Arrow &&
+                  lineType->tool() == Tool::Arrow);
+            const QImage arrowIcon = lineType->icon().pixmap(QSize(64, 64)).toImage();
+            check("arrow mode shows a dark arrow and a gray line", arrowIcon.pixelColor(32, 22).lightness() < 60 &&
+                  arrowIcon.pixelColor(32, 46).lightness() > 140);
+            lineType->grab().save(QDir(directory).filePath("line-type-arrow.png"));
+            lineType->click();
+            check("same mode button switches back to line", inlineCanvas->tool() == Tool::Line &&
+                  lineType->tool() == Tool::Line);
+            lineType->click();
+            QTest::keyClick(inlineCanvas, Qt::Key_Tab);
+            check("inline Tab synchronizes the line type button", inlineCanvas->tool() == Tool::Line &&
+                  lineType->tool() == Tool::Line);
             QTest::keyClick(inlineCanvas, Qt::Key_Tab);
             check("inline Tab switch updates the shared button",
                   inlineCanvas->tool() == Tool::Arrow && lineButton->defaultAction() == arrowAction && arrowAction->isChecked());
@@ -865,6 +980,7 @@ int runSelfTests(const QString &directory, bool native) {
             inlineOverlay.grab().save(QDir(directory).filePath("capture-line-endpoints.png"));
             inlineOverlay.findChild<QWidget *>("captureToolOptions")->grab().save(
                 QDir(directory).filePath("line-style-options.png"));
+            lineType->grab().save(QDir(directory).filePath("line-type-button.png"));
             inlineCanvas->undo();
             lineAction->trigger();
             inlineOverlay.findChild<QAction *>("captureTool1")->trigger();
@@ -960,8 +1076,8 @@ int runSelfTests(const QString &directory, bool native) {
         auto *primary = contextual.findChild<QWidget *>("captureEditorToolbar");
         auto *options = contextual.findChild<QWidget *>("captureToolOptions");
         auto *canvas = contextual.findChild<AnnotationCanvas *>();
-        auto *variant = contextual.findChild<QComboBox *>("captureToolVariant");
-        auto *effectShape = contextual.findChild<QComboBox *>("captureEffectShape");
+        auto *variant = contextual.findChild<OptionStrip *>("captureToolVariant");
+        auto *effectShape = contextual.findChild<OptionStrip *>("captureEffectShape");
         auto *color = contextual.findChild<QPushButton *>("annotationColor");
         auto *font = contextual.findChild<ValueSlider *>("captureFontSize");
         auto *width = contextual.findChild<ValueSlider *>("captureStrokeWidth");
@@ -998,6 +1114,17 @@ int runSelfTests(const QString &directory, bool native) {
         check("opacity slider reaches transparent endpoint", canvas->style().color.alpha() == 0);
         opacity->setValue(100);
         check("opacity slider reaches opaque endpoint", canvas->style().color.alpha() == 255);
+        check("expanded annotation panel contains no dropdowns", options->findChildren<QComboBox *>().isEmpty());
+        auto *directLine = options->findChild<OptionStrip *>("captureLineStyle");
+        directLine->findChildren<QToolButton *>().at(1)->click();
+        check("two line-style icons select solid or dashed strokes", directLine->count() == 2 &&
+              directLine->findChildren<QToolButton *>().first()->toolButtonStyle() == Qt::ToolButtonIconOnly &&
+              canvas->style().lineStyle == int(Qt::DashLine));
+        auto *directFill = options->findChild<OptionStrip *>("captureFillMode");
+        directFill->findChildren<QToolButton *>().at(1)->click();
+        check("direct fill button sets drawing fill", canvas->style().fill == canvas->style().color);
+        directFill->findChildren<QToolButton *>().at(0)->click();
+        check("direct hollow button clears drawing fill", canvas->style().fill.alpha() == 0);
         const int ellipseIndex = variant->findData(int(Tool::Ellipse));
         variant->setCurrentIndex(ellipseIndex);
         QMetaObject::invokeMethod(variant, "activated", Qt::DirectConnection, Q_ARG(int, ellipseIndex));
@@ -1056,7 +1183,7 @@ int runSelfTests(const QString &directory, bool native) {
         auto *options = active.findChild<QWidget *>("captureToolOptions");
         auto *width = active.findChild<ValueSlider *>("captureStrokeWidth");
         auto *opacity = active.findChild<ValueSlider *>("captureOpacity");
-        auto *variant = active.findChild<QComboBox *>("captureToolVariant");
+        auto *lineType = active.findChild<LineTypeButton *>("captureLineTypeButton");
         auto drag = [&](const QPoint &from, const QPoint &to) {
             QTest::mousePress(canvas, Qt::LeftButton, {}, from);
             QMouseEvent move(QEvent::MouseMove, QPointF(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
@@ -1088,11 +1215,21 @@ int runSelfTests(const QString &directory, bool native) {
         opacity->setValue(50);
         check("palette and opacity edit the active arrow", canvas->style().color == QColor(88, 166, 255, 128) &&
               canvas->document().annotations.size() == 1);
-        const int line = variant->findData(int(Tool::Line));
-        QMetaObject::invokeMethod(variant, "activated", Qt::DirectConnection, Q_ARG(int, line));
+        lineType->click();
         check("secondary variant edits active object without resetting its geometry", canvas->selectedIndex() == 0 &&
               canvas->style().tool == Tool::Line && canvas->tool() == Tool::Arrow &&
-              canvas->style().points == QVector<QPointF>{{90, 110}, {310, 170}});
+              canvas->style().points == QVector<QPointF>{{90, 110}, {310, 170}} &&
+              canvas->style().width == 12 && canvas->style().color == QColor(88, 166, 255, 128));
+        canvas->undo();
+        check("mode toggle undo restores the arrow", canvas->document().annotations.first().tool == Tool::Arrow &&
+              lineType->tool() == Tool::Arrow && canvas->document().annotations.size() == 1);
+        canvas->redo();
+        check("type conversion redo restores the selected button", canvas->selectedIndex() == 0 &&
+              lineType->tool() == Tool::Line && canvas->style().tool == Tool::Line);
+        lineType->click();
+        check("mode button toggles the active object back to arrow", canvas->selectedIndex() == 0 &&
+              canvas->style().tool == Tool::Arrow && lineType->tool() == Tool::Arrow);
+        lineType->click();
         active.grab().save(QDir(directory).filePath("capture-active-annotation.png"));
         QTest::mouseClick(canvas, Qt::RightButton, {}, {450, 220});
         check("ending object editing restores drawing defaults", canvas->selectedIndex() == -1 &&
@@ -1109,7 +1246,8 @@ int runSelfTests(const QString &directory, bool native) {
         const Annotation shapeDefaults = canvas->style();
         QTest::mouseClick(canvas, Qt::LeftButton, {}, {200, 140});
         check("other drawing tool reactivates existing line with matching inspector", canvas->tool() == Tool::Rectangle &&
-              canvas->selectedIndex() == 0 && width->value() == 12 && variant->currentData().toInt() == int(Tool::Line));
+              canvas->selectedIndex() == 0 && width->value() == 12 && lineType->isVisible() &&
+              lineType->tool() == Tool::Line);
         width->setValue(16);
         QTest::mouseClick(canvas, Qt::RightButton, {}, {450, 220});
         check("editing another tool's object preserves current tool defaults", canvas->tool() == Tool::Rectangle &&
@@ -1293,7 +1431,7 @@ int runSelfTests(const QString &directory, bool native) {
         auto *opacity = penOverlay.findChild<ValueSlider *>("captureOpacity");
         auto *width = penOverlay.findChild<ValueSlider *>("captureStrokeWidth");
         check("pen exposes opacity without a separate marker tool", opacity->isVisible() && width->isVisible() &&
-              !penOverlay.findChild<QComboBox *>("captureEffectShape")->isVisible() && !penOverlay.findChild<QAction *>("captureTool8"));
+              !penOverlay.findChild<OptionStrip *>("captureEffectShape")->isVisible() && !penOverlay.findChild<QAction *>("captureTool8"));
         opacity->setValue(40);
         width->setValue(18);
         QTest::mousePress(canvas, Qt::LeftButton, {}, {40, 80});
@@ -1475,44 +1613,92 @@ int runSelfTests(const QString &directory, bool native) {
     manager.show();
     QCoreApplication::processEvents();
     QTest::qWait(100);
+    manager.grab().save(QDir(directory).filePath("library-compact.png"));
+    manager.resize(uiPixels(1120), uiPixels(760));
+    QCoreApplication::processEvents();
     manager.grab().save(QDir(directory).filePath("library.png"));
+    {
+        auto *gallery = manager.findChild<QListWidget *>("historyGallery");
+        QSignalSpy editRequest(&manager, &LibraryWindow::recordAction);
+        if (gallery && gallery->count()) {
+            const QPoint at = gallery->visualItemRect(gallery->item(0)).center();
+            QTest::mouseClick(gallery->viewport(), Qt::LeftButton, {}, at);
+            QTest::mouseDClick(gallery->viewport(), Qt::LeftButton, {}, at);
+        }
+        check("history cards retain double-click editing", editRequest.count() == 1 &&
+              editRequest.first().at(1).toString() == "edit");
+        auto *search = manager.findChild<QLineEdit *>("historySearch");
+        search->setText("no matching screenshot");
+        check("history search shows an empty result", gallery->isHidden());
+        manager.grab().save(QDir(directory).filePath("library-search-empty.png"));
+        search->clear();
+    }
     manager.hide();
     auto *editor = new EditorWindow(document, settings);
     editor->setAttribute(Qt::WA_DontShowOnScreen);
     editor->show();
     QCoreApplication::processEvents();
     QTest::qWait(100);
+    editor->grab().save(QDir(directory).filePath("editor-compact.png"));
+    editor->resize(uiPixels(1240), uiPixels(820));
+    QCoreApplication::processEvents();
+    const auto *canvasArea = editor->findChild<QScrollArea *>("canvasArea");
+    editor->canvas()->setZoom(qMin(1.0, qMin(double(canvasArea->viewport()->width() - 24) / document.image.width(),
+                                           double(canvasArea->viewport()->height() - 24) / document.image.height())));
     editor->grab().save(QDir(directory).filePath("editor.png"));
     check("editor has no retired highlighter tool", !editor->findChild<QAction *>("editorTool8"));
     check("editor defaults to selection without a selection button",
           editor->canvas()->tool() == Tool::Select && !editor->findChild<QAction *>("editorTool0"));
-    auto *lineButton = editor->findChild<QToolButton *>("editorLineToolButton");
+    auto *lineType = editor->findChild<LineTypeButton *>("editorLineTypeButton");
     auto *lineAction = editor->findChild<QAction *>("editorTool" + toolKey(Tool::Line));
     auto *arrowAction = editor->findChild<QAction *>("editorTool" + toolKey(Tool::Arrow));
-    check("editor line menu contains exactly line and arrow styles",
-          lineButton && lineButton->menu() && lineButton->menu()->actions().size() == 2 &&
-          lineButton->menu()->actions().contains(lineAction) && lineButton->menu()->actions().contains(arrowAction));
-    if (lineButton && lineAction && arrowAction) {
+    check("editor offers one cycling line mode button",
+          lineType && lineType->isVisible() && lineType->toolButtonStyle() == Qt::ToolButtonIconOnly && !lineType->menu());
+    if (lineType && lineAction && arrowAction) {
         lineAction->trigger();
-        check("editor line style updates the shared button",
-              editor->canvas()->tool() == Tool::Line && lineButton->defaultAction() == lineAction && lineAction->isChecked());
+        check("editor line style updates the direct button",
+              editor->canvas()->tool() == Tool::Line && lineType->tool() == Tool::Line && lineAction->isChecked());
         editor->canvas()->setTool(Tool::Rectangle);
-        lineButton->click();
-        check("editor line button remembers the chosen style", editor->canvas()->tool() == Tool::Line);
+        lineType->click();
+        check("editor mode button toggles and activates the line tool", editor->canvas()->tool() == Tool::Arrow &&
+              lineType->tool() == Tool::Arrow);
         QTest::keyClick(editor->canvas(), Qt::Key_Tab);
-        check("editor Tab switch updates the shared button",
-              editor->canvas()->tool() == Tool::Arrow && lineButton->defaultAction() == arrowAction && arrowAction->isChecked());
+        check("editor Tab switch updates the mode button",
+              editor->canvas()->tool() == Tool::Line && lineType->tool() == Tool::Line && lineAction->isChecked());
         editor->canvas()->setTool(Tool::Polyline);
         auto *polylineAction = editor->findChild<QAction *>("editorTool" + toolKey(Tool::Polyline));
         check("editor polyline remains separately available",
               polylineAction && polylineAction->isChecked() && !arrowAction->isChecked());
-        lineButton->click();
-        lineButton->click();
-        bool inactive = true;
-        for (auto *action : editor->findChildren<QAction *>())
-            if (action->objectName().startsWith("editorTool") && action->isChecked())
-                inactive = false;
-        check("editor active tool click returns to default selection", editor->canvas()->tool() == Tool::Select && inactive);
+        lineType->click();
+        lineType->click();
+        check("repeated editor mode clicks alternate line types", editor->canvas()->tool() == Tool::Line &&
+              lineType->tool() == Tool::Line && lineAction->isChecked());
+        auto *canvas = editor->canvas();
+        canvas->setDocument(sampleDocument());
+        canvas->setTool(Tool::Arrow);
+        canvas->setZoom(1);
+        QTest::mousePress(canvas, Qt::LeftButton, {}, {100, 300});
+        QMouseEvent drag(QEvent::MouseMove, QPointF(300, 300), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &drag);
+        QTest::mouseRelease(canvas, Qt::LeftButton, {}, {300, 300});
+        const Annotation original = canvas->style();
+        lineType->click();
+        check("editor line button converts the selected arrow and preserves its properties",
+              canvas->selectedIndex() == 0 && canvas->style().tool == Tool::Line &&
+              canvas->style().points == original.points && canvas->style().color == original.color &&
+              canvas->style().width == original.width && lineType->tool() == Tool::Line);
+        canvas->undo();
+        check("editor type button conversion supports undo", canvas->document().annotations.first().toJson() == original.toJson());
+        canvas->redo();
+        check("editor type button conversion supports redo", canvas->selectedIndex() == 0 &&
+              canvas->style().tool == Tool::Line && lineType->tool() == Tool::Line);
+        canvas->setTool(Tool::Select);
+        QTest::mouseClick(canvas, Qt::LeftButton, {}, {200, 300});
+        lineType->click();
+        check("editor mode button edits objects in default selection mode", canvas->tool() == Tool::Select &&
+              canvas->selectedIndex() == 0 && canvas->style().tool == Tool::Arrow && lineType->tool() == Tool::Arrow);
+        lineType->grab().save(QDir(directory).filePath("editor-line-type-button.png"));
+        editor->grab().save(QDir(directory).filePath("editor-line-types.png"));
     }
     {
         auto *width = editor->findChild<ValueSlider *>("editorStrokeWidth");
@@ -1548,6 +1734,23 @@ int runSelfTests(const QString &directory, bool native) {
         radius->setValue(32);
         check("editor corner radius slider updates image", canvas->document().cornerRadius == 32);
         editor->grab().save(QDir(directory).filePath("editor-sliders.png"));
+
+        auto legacyDocument = canvas->document();
+        legacyDocument.annotations.first().lineStyle = int(Qt::DotLine);
+        canvas->setDocument(Document::fromJson(legacyDocument.toJson(), legacyDocument.image));
+        canvas->setTool(Tool::Select);
+        QTest::mouseClick(canvas, Qt::LeftButton, {}, {100, 140});
+        auto *lineStyle = editor->findChild<OptionStrip *>("editorLineStyle");
+        check("legacy dotted annotation has no removed option in editor", lineStyle && lineStyle->count() == 2 &&
+              lineStyle->currentIndex() == -1 && canvas->selectedIndex() == 0);
+        width->setValue(18);
+        check("editing legacy annotation width preserves its stored line style", canvas->style().width == 18 &&
+              canvas->style().lineStyle == int(Qt::DotLine));
+        lineStyle->findChildren<QToolButton *>().at(1)->click();
+        check("editor dashed icon updates the selected annotation", canvas->style().lineStyle == int(Qt::DashLine));
+        canvas->undo();
+        check("undo line-style icon restores the legacy stroke",
+              canvas->document().annotations.first().lineStyle == int(Qt::DotLine));
     }
     editor->hide();
     delete editor;
@@ -1994,6 +2197,108 @@ int runSelfTests(const QString &directory, bool native) {
         check("OpenGL preview initialization", accelerated.acceleratedPreview());
         accelerated.hide();
         settings.set("runtime/gpuPreview", false);
+    }
+    // Render actual widgets at common Windows display scales, including the modal settings pages.
+    // All settings use the temporary test directory and the dialog is always canceled.
+    {
+        class HidePreviewDialogs final : public QObject {
+          public:
+            bool eventFilter(QObject *object, QEvent *event) override {
+                if (event->type() == QEvent::Polish && object->objectName() == "settingsDialog")
+                    if (auto *widget = qobject_cast<QWidget *>(object))
+                        widget->setAttribute(Qt::WA_DontShowOnScreen);
+                return false;
+            }
+        } hideDialogs;
+        qApp->installEventFilter(&hideDialogs);
+        for (int percent : {100, 150, 200}) {
+            settings.set("appearance/uiScale", percent / 100.0);
+            applyAppearance(settings);
+            const QString suffix = QString::number(percent);
+            LibraryWindow scaledLibrary(library, settings);
+            scaledLibrary.setAttribute(Qt::WA_DontShowOnScreen);
+            scaledLibrary.show();
+            scaledLibrary.resize(uiPixels(1120), uiPixels(760));
+            auto *scaledEditor = new EditorWindow(document, settings);
+            scaledEditor->setAttribute(Qt::WA_DontShowOnScreen);
+            scaledEditor->show();
+            scaledEditor->resize(uiPixels(1240), uiPixels(820));
+            QCoreApplication::processEvents();
+            QTest::qWait(20);
+            scaledLibrary.grab().save(QDir(directory).filePath("library-" + suffix + ".png"));
+            scaledEditor->grab().save(QDir(directory).filePath("editor-" + suffix + ".png"));
+            auto *strip = scaledEditor->findChild<QFrame *>("editorToolStrip");
+            const auto *toolScroll = strip->findChild<QScrollArea *>();
+            check("editor toolbar fits at " + suffix + " percent", toolScroll->horizontalScrollBar()->maximum() == 0);
+            scaledLibrary.hide();
+            scaledEditor->hide();
+            delete scaledEditor;
+
+            Native::Desktop previewDesktop;
+            previewDesktop.image = document.image.scaled(uiPixels(1280), uiPixels(800), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            previewDesktop.geometry = previewDesktop.image.rect();
+            previewDesktop.screens = {previewDesktop.geometry};
+            CaptureOverlay scaledCapture(previewDesktop, settings,
+                QRect(uiPixels(100), uiPixels(120), uiPixels(900), uiPixels(360)));
+            scaledCapture.setAttribute(Qt::WA_DontShowOnScreen);
+            scaledCapture.show();
+            scaledCapture.findChild<QAction *>("captureTool" + toolKey(Tool::Pen))->trigger();
+            QCoreApplication::processEvents();
+            scaledCapture.grab().save(QDir(directory).filePath("capture-" + suffix + ".png"));
+            auto *toolbar = scaledCapture.findChild<QFrame *>("captureEditorToolbar");
+            auto *options = scaledCapture.findChild<QFrame *>("captureToolOptions");
+            check("capture panels fit at " + suffix + " percent",
+                  scaledCapture.rect().contains(toolbar->geometry()) && scaledCapture.rect().contains(options->geometry()));
+            for (Tool tool : {Tool::Rectangle, Tool::Arrow, Tool::Mosaic, Tool::Eraser, Tool::Text}) {
+                scaledCapture.findChild<QAction *>("captureTool" + toolKey(tool))->trigger();
+                QCoreApplication::processEvents();
+                check("direct tool panel fits " + toolKey(tool) + " at " + suffix,
+                      scaledCapture.rect().contains(options->geometry()) && options->findChildren<QComboBox *>().isEmpty());
+                options->grab().save(QDir(directory).filePath("tool-panel-" + toolKey(tool) + "-" + suffix + ".png"));
+            }
+            scaledCapture.hide();
+
+            bool navigated = false;
+            QTimer::singleShot(0, qApp, [&] {
+                QDialog *dialog = nullptr;
+                for (auto *widget : QApplication::topLevelWidgets())
+                    if (widget->objectName() == "settingsDialog")
+                        dialog = qobject_cast<QDialog *>(widget);
+                if (!dialog)
+                    return;
+                dialog->resize(uiPixels(960), uiPixels(760));
+                auto *navigation = dialog->findChild<QListWidget *>("settingsNavigation");
+                auto *pages = dialog->findChild<QStackedWidget *>();
+                navigated = navigation && pages && navigation->count() == 4;
+                if (navigated) {
+                    for (int row = 0; row < 4; ++row) {
+                        navigation->setCurrentRow(row);
+                        QCoreApplication::processEvents();
+                        navigated = navigated && pages->currentIndex() == row && pages->currentWidget()->isVisible();
+                        dialog->grab().save(QDir(directory).filePath(QString("settings-%1-%2.png").arg(row).arg(suffix)));
+                    }
+                    if (percent == 100) {
+                        navigation->setCurrentRow(0);
+                        dialog->resize(736, 552);
+                        QCoreApplication::processEvents();
+                        dialog->grab().save(QDir(directory).filePath("settings-compact.png"));
+                    }
+                }
+                // Exercise Cancel after making an unsaved edit.
+                const auto edits = dialog->findChildren<QLineEdit *>();
+                if (!edits.isEmpty())
+                    edits.first()->setText("unsaved preview edit");
+                dialog->reject();
+            });
+            const QString before = settings.value("appearance/accent", "#0067c0").toString();
+            const bool accepted = showSettings(settings, nullptr);
+            check("settings categories navigate at " + suffix + " percent", navigated);
+            check("cancel settings preserves preferences at " + suffix + " percent",
+                  !accepted && settings.value("appearance/accent", "#0067c0").toString() == before);
+        }
+        qApp->removeEventFilter(&hideDialogs);
+        settings.set("appearance/uiScale", 1.0);
+        applyAppearance(settings);
     }
     QJsonObject report{{"qt", qVersion()}, {"native", native}, {"elevated", Native::isElevated()},
                        {"failed", failures}, {"checks", checks}};

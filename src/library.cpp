@@ -371,6 +371,9 @@ LibraryWindow::LibraryWindow(Library &library, Settings &settings) : library_(li
     side->addWidget(capture);
     capture->setToolTip(QStringLiteral("区域截图 · %1").arg(settings.shortcut("capture")));
     connect(capture, &QPushButton::clicked, this, [this] { emit command("capture"); });
+    auto *scrollCapture = new QPushButton(Ui::commandIcon("scroll"), QStringLiteral("滚动长截屏"));
+    side->addWidget(scrollCapture);
+    connect(scrollCapture, &QPushButton::clicked, this, [this] { emit command("scroll"); });
     auto *shortcut = new QLabel(QStringLiteral("按 %1 随时截图").arg(settings.shortcut("capture")));
     shortcut->setObjectName("muted");
     shortcut->setAlignment(Qt::AlignCenter);

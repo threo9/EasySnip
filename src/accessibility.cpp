@@ -141,6 +141,64 @@ bool collect(IUIAutomation *automation, IUIAutomationElement *element, IUIAutoma
 }
 } // namespace
 
+QRect Native::scrollingViewport(quintptr window, const QPoint &point) {
+    if (!window || !IsWindow(reinterpret_cast<HWND>(window)))
+        return {};
+    Apartment apartment;
+    if (FAILED(apartment.status))
+        return {};
+    auto automation = createAutomation();
+    if (!automation)
+        return {};
+    constexpr int ScrollAvailable = 30034;
+    constexpr int VerticallyScrollable = 30058;
+    IUIAutomationElement *rawRoot = nullptr;
+    IUIAutomationCacheRequest *rawCache = nullptr;
+    if (FAILED(automation->ElementFromHandle(reinterpret_cast<HWND>(window), &rawRoot)) || !rawRoot)
+        return {};
+    ComPtr<IUIAutomationElement> root(rawRoot);
+    if (FAILED(automation->CreateCacheRequest(&rawCache)) || !rawCache)
+        return {};
+    ComPtr<IUIAutomationCacheRequest> cache(rawCache);
+    for (int property : {BoundingRectangle, IsOffscreen, VerticallyScrollable})
+        cache->AddProperty(property);
+    cache->put_TreeScope(TreeScope_Element);
+    cache->put_AutomationElementMode(AutomationElementMode_None);
+    VARIANT value;
+    VariantInit(&value);
+    value.vt = VT_BOOL;
+    value.boolVal = VARIANT_TRUE;
+    IUIAutomationCondition *rawCondition = nullptr;
+    if (FAILED(automation->CreatePropertyCondition(ScrollAvailable, value, &rawCondition)) || !rawCondition)
+        return {};
+    ComPtr<IUIAutomationCondition> condition(rawCondition);
+    IUIAutomationElementArray *rawElements = nullptr;
+    if (FAILED(root->FindAllBuildCache(TreeScope_Subtree, condition.get(), cache.get(), &rawElements)) || !rawElements)
+        return {};
+    ComPtr<IUIAutomationElementArray> elements(rawElements);
+    int count = 0;
+    elements->get_Length(&count);
+    QRect result;
+    for (int i = 0; i < qMin(count, 128); ++i) {
+        IUIAutomationElement *rawElement = nullptr;
+        if (FAILED(elements->GetElement(i, &rawElement)) || !rawElement)
+            continue;
+        ComPtr<IUIAutomationElement> element(rawElement);
+        const QRect bounds = cachedRectangle(automation.get(), element.get());
+        VariantInit(&value);
+        element->GetCachedPropertyValue(VerticallyScrollable, &value);
+        const bool scrollable = value.vt == VT_BOOL && value.boolVal == VARIANT_TRUE;
+        VariantClear(&value);
+        element->GetCachedPropertyValue(IsOffscreen, &value);
+        const bool hidden = value.vt == VT_BOOL && value.boolVal == VARIANT_TRUE;
+        VariantClear(&value);
+        if (scrollable && !hidden && bounds.contains(point) &&
+            (result.isEmpty() || qint64(bounds.width()) * bounds.height() < qint64(result.width()) * result.height()))
+            result = bounds;
+    }
+    return result;
+}
+
 QVector<QRect> Native::automationElements(quintptr window, const QPoint *point, bool *complete) {
     if (complete)
         *complete = false;

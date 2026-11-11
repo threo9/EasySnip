@@ -69,7 +69,7 @@ int main(int argc, char *argv[]) {
     parser.setApplicationDescription(QStringLiteral("EasySnip — Windows 截图与标注工具"));
     parser.addHelpOption();
     parser.addVersionOption();
-    for (const QString &option : {"tray", "capture", "screen", "fullscreen", "active", "last", "settings", "quit", "admin", "native-smoke-test"})
+    for (const QString &option : {"tray", "capture", "scroll", "screen", "fullscreen", "active", "last", "settings", "quit", "admin", "native-smoke-test"})
         parser.addOption(QCommandLineOption(option));
     parser.addOption(QCommandLineOption("open", "Open an image file", "path"));
     parser.addOption(QCommandLineOption("data-dir", "Override application data directory", "path"));

@@ -22,14 +22,16 @@ class QBoxLayout;
 class CaptureOverlay : public QWidget {
     Q_OBJECT
   public:
-    CaptureOverlay(Native::Desktop desktop, Settings &settings, const QRect &initial = {});
+    CaptureOverlay(Native::Desktop desktop, Settings &settings, const QRect &initial = {}, bool scrollMode = false);
     QRect selectedGlobal() const;
     void completeOutput(bool successful, bool closeCapture = true);
     void setHistory(int count, std::function<Document(int)> loader);
+    void resumeScrollCapture();
   signals:
     void outputRequested(Document document, QRect globalRect, QString action, bool skipAutoSave);
     void canceled(Document document);
     void draftAbandoned(Document document);
+    void scrollRequested(QRect region, Document draft);
 
   protected:
     void paintEvent(QPaintEvent *) override;
@@ -50,6 +52,7 @@ class CaptureOverlay : public QWidget {
     Document selectionDocument() const;
     QImage backgroundImage() const;
     void requestOutput(const QString &action = "finish");
+    void requestScrollCapture();
     void cancel();
     void createEditorToolbar();
     void syncSelection();
@@ -109,6 +112,7 @@ class CaptureOverlay : public QWidget {
     bool selecting_ = true;
     bool outputPending_ = false;
     bool resumeRefresh_ = false;
+    bool scrollMode_ = false;
     int magnifierOverride_ = -1;
     bool altUsed_ = false;
     int handle_ = -1;

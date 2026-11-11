@@ -3,6 +3,7 @@
 #include "editor.h"
 #include "library.h"
 #include "native.h"
+#include "scrollcapture.h"
 #include <QPointer>
 #include <QSystemTrayIcon>
 #include <QElapsedTimer>
@@ -22,7 +23,7 @@ class Application : public QObject {
     friend int runSelfTests(const QString &directory, bool native);
     void configureInput();
     void capture(const QString &mode = "region", const QRect &preset = {}, int delay = -1);
-    void showCapture(Native::Desktop desktop, const QRect &initial);
+    void showCapture(Native::Desktop desktop, const QRect &initial, bool scrollMode = false);
     void capturePreset();
     void edit(Document document, const QRect &sourceRect = {}, const QString &recordId = {});
     void openImage(const QString &path);
@@ -42,6 +43,7 @@ class Application : public QObject {
     GlobalInput input_;
     QVector<QPointer<EditorWindow>> editors_;
     QPointer<CaptureOverlay> capture_;
+    QPointer<ScrollCaptureWindow> scrollCapture_;
     QTimer corners_;
     QTimer themeTimer_;
     QTimer hotkeyRetry_;

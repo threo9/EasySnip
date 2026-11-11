@@ -41,6 +41,7 @@ Application::Application(Settings &settings, QObject *parent)
     trayMenu_ = new QMenu;
     for (const auto &pair :
          QVector<QPair<QString, QString>>{{QStringLiteral("区域截图"), "capture"},
+                                          {QStringLiteral("滚动长截屏"), "scroll"},
                                           {QStringLiteral("当前屏幕"), "screen"},
                                           {QStringLiteral("全屏截图"), "fullscreen"},
                                           {QStringLiteral("活动窗口"), "active"},
@@ -103,6 +104,7 @@ Application::Application(Settings &settings, QObject *parent)
 }
 Application::~Application() {
     input_.clear();
+    delete scrollCapture_.data();
     delete capture_.data();
     for (const auto &editor : editors_)
         if (editor)
@@ -116,6 +118,8 @@ void Application::start(const QStringList &arguments) {
 void Application::processArguments(const QStringList &arguments) {
     if (arguments.contains("--capture"))
         command("capture");
+    else if (arguments.contains("--scroll"))
+        command("scroll");
     else if (arguments.contains("--screen"))
         command("screen");
     else if (arguments.contains("--fullscreen"))
@@ -191,7 +195,7 @@ void Application::configureInput() {
 void Application::command(const QString &action) {
     if (action == "capture")
         capture();
-    else if (action == "fullscreen" || action == "screen" || action == "active" || action == "last")
+    else if (action == "fullscreen" || action == "screen" || action == "active" || action == "last" || action == "scroll")
         capture(action);
     else if (action == "preset")
         capturePreset();
@@ -277,15 +281,44 @@ void Application::capture(const QString &mode, const QRect &preset, int delay) {
                     initial = screen;
         if (mode == "last")
             initial = settings_.value("capture/lastRect").toRect();
-        showCapture(std::move(desktop), initial);
+        showCapture(std::move(desktop), initial, mode == "scroll");
         qInfo() << "Capture overlay ready in" << elapsed.elapsed() << "ms";
         });
         watcher->setFuture(QtConcurrent::run([] { return Native::captureDesktop(true); }));
     });
 }
-void Application::showCapture(Native::Desktop desktop, const QRect &initial) {
-    capture_ = new CaptureOverlay(std::move(desktop), settings_, initial);
+void Application::showCapture(Native::Desktop desktop, const QRect &initial, bool scrollMode) {
+    capture_ = new CaptureOverlay(std::move(desktop), settings_, initial, scrollMode);
     auto *overlay = capture_.data();
+    connect(overlay, &CaptureOverlay::scrollRequested, this, [this, overlay](const QRect &rect, const Document &draft) {
+        scrollCapture_ = new ScrollCaptureWindow(rect);
+        auto *scroll = scrollCapture_.data();
+        connect(scrollCapture_, &ScrollCaptureWindow::canceled, overlay, &CaptureOverlay::resumeScrollCapture);
+        connect(scroll, &ScrollCaptureWindow::copyRequested, this,
+                [this, overlay, scroll, rect, draft](Document document) {
+            document.annotations = draft.annotations;
+            document.cornerRadius = draft.cornerRadius;
+            QString id = scroll->property("recordId").toString();
+            const bool successful = output(document, "copy", scroll, id, false);
+            scroll->setProperty("recordId", id);
+            if (successful) {
+                settings_.set("capture/lastRect", rect);
+                settings_.sync();
+                overlay->completeOutput(true);
+            }
+            scroll->completeCopy(successful);
+        });
+        connect(scrollCapture_, &ScrollCaptureWindow::completed, this,
+                [this, overlay, rect, draft](Document document) {
+            document.annotations = draft.annotations;
+            document.cornerRadius = draft.cornerRadius;
+            settings_.set("capture/lastRect", rect);
+            settings_.sync();
+            overlay->completeOutput(true);
+            edit(document);
+        });
+        scrollCapture_->show();
+    });
     QStringList history;
     for (const auto &record : library_.records())
         history.append(record.id);
@@ -521,6 +554,10 @@ bool Application::output(const Document &document, const QString &action, QWidge
             if (!file.isEmpty())
                 mime->setUrls({QUrl::fromLocalFile(file)});
             QApplication::clipboard()->setMimeData(mime);
+            if (QGuiApplication::platformName() == "windows" && !QApplication::clipboard()->ownsClipboard()) {
+                successful = false;
+                notify(QStringLiteral("剪贴板正在被使用，请稍后重试复制。"), true);
+            }
         } else if (target == "save") {
             const QString path = quickSave(image);
             if (path.isEmpty())

@@ -28,8 +28,20 @@ struct Desktop {
     QPoint cursorHotspot;
     QVector<WindowSnapshot> windows;
 };
+struct ScrollTarget {
+    quintptr window = 0;
+    quintptr root = 0;
+    quint32 processId = 0;
+    QRect geometry;
+    QPoint point;
+};
 void enableDpiAwareness();
 Desktop captureDesktop(bool snapshotElements = false);
+QImage captureRegion(const QRect &region);
+ScrollTarget scrollTarget(const QRect &region);
+QRect scrollingViewport(quintptr window, const QPoint &point);
+bool scrollTargetValid(const ScrollTarget &target, const QRect &region, quintptr ignoredWindow = 0);
+bool excludeFromCapture(quintptr window);
 QRect foregroundWindow();
 QRect windowAt(const QPoint &point, const QStringList &excluded = {}, const QVector<WindowSnapshot> &windows = {});
 QVector<QRect> elementsAt(const QPoint &point, const QStringList &excluded = {},

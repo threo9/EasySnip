@@ -59,7 +59,7 @@ bool Settings::ignoresShortcut(const QString &command, const QString &executable
 }
 
 QString Settings::action(const QString &key, const QString &fallback) const {
-    const QStringList commands{"capture", "screen", "fullscreen", "active", "last", "preset",
+    const QStringList commands{"capture", "scroll", "screen", "fullscreen", "active", "last", "preset",
         "history", "settings", "menu", "none", "clear-history", "backup", "restore", "custom-command", "quit"};
     const QString selected = value(key, fallback).toString();
     return commands.contains(selected) ? selected : fallback;
@@ -168,8 +168,8 @@ bool showSettings(Settings &settings, QWidget *parent) {
     text(general, QStringLiteral("强调色 HEX"), "appearance/accent", "#0067c0");
     text(general, QStringLiteral("界面字体"), "appearance/font", "Microsoft YaHei UI");
     text(general, QStringLiteral("自定义托盘图标路径"), "appearance/icon", "");
-    const QStringList actions{"capture", "history", "settings", "menu", "none"};
-    const QStringList labels{QStringLiteral("截图"), QStringLiteral("截图历史"),
+    const QStringList actions{"capture", "scroll", "history", "settings", "menu", "none"};
+    const QStringList labels{QStringLiteral("截图"), QStringLiteral("滚动长截屏"), QStringLiteral("截图历史"),
                              QStringLiteral("设置"),          QStringLiteral("菜单"),
                              QStringLiteral("无操作")};
     choices(general, QStringLiteral("托盘左键"), "tray/left", actions, labels, "capture");

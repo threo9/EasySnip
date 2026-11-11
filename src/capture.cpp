@@ -69,9 +69,9 @@ const QVector<QVector<Tool>> &annotationToolGroups() {
 
 } // namespace
 
-CaptureOverlay::CaptureOverlay(Native::Desktop desktop, Settings &settings, const QRect &initial)
+CaptureOverlay::CaptureOverlay(Native::Desktop desktop, Settings &settings, const QRect &initial, bool scrollMode)
     : QWidget(nullptr, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint),
-      desktop_(std::move(desktop)), settings_(settings) {
+      desktop_(std::move(desktop)), settings_(settings), scrollMode_(scrollMode) {
     setAttribute(Qt::WA_DeleteOnClose);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
@@ -216,6 +216,11 @@ void CaptureOverlay::createEditorToolbar() {
             canvas_->redo();
     });
     bar = outputTools_;
+    auto *scroll = bar->addAction(Ui::commandIcon("scroll"), QStringLiteral("滚动长截屏 · Ctrl+L"),
+                                 this, &CaptureOverlay::requestScrollCapture);
+    scroll->setObjectName("captureScroll");
+    scroll->setShortcut(QKeySequence("Ctrl+L"));
+    scroll->setShortcutContext(Qt::WindowShortcut);
     bar->addAction(Ui::commandIcon("cancel"), QStringLiteral("取消 · Esc"), this, &CaptureOverlay::cancel);
     auto output = [this, bar](const QString &label, const QString &name, const QString &key) {
         auto *action = bar->addAction(Ui::commandIcon(name), label, this, [this, name] {
@@ -233,7 +238,8 @@ void CaptureOverlay::createEditorToolbar() {
     connect(copyKey, &QShortcut::activated, copy, &QAction::trigger);
     auto *quickSaveKey = new QShortcut(QKeySequence("Ctrl+Shift+S"), this);
     connect(quickSaveKey, &QShortcut::activated, this, [this] { requestOutput("save"); });
-    output(QStringLiteral("完成 · Enter"), "finish", "Ctrl+Return");
+    output(scrollMode_ ? QStringLiteral("开始长截屏 · Enter") : QStringLiteral("完成 · Enter"),
+           "finish", "Ctrl+Return");
     auto *more = new QToolButton;
     more->setObjectName("captureMore");
     more->setIcon(Ui::commandIcon("more"));
@@ -654,6 +660,10 @@ Document CaptureOverlay::selectionDocument() const {
     return canvas_ ? canvas_->document() : selectionBackground();
 }
 void CaptureOverlay::syncSelection() {
+    findChild<QAction *>("captureScroll")->setEnabled(historyIndex_ < 0);
+    if (scrollMode_)
+        findChild<QAction *>("captureOutput-finish")->setText(historyIndex_ < 0
+            ? QStringLiteral("开始长截屏 · Enter") : QStringLiteral("完成 · Enter"));
     if (selection_.isEmpty()) {
         toolbar_->show();
         editorToolbar_->hide();
@@ -809,6 +819,10 @@ void CaptureOverlay::replayHistory(int direction) {
         setFocus();
 }
 void CaptureOverlay::requestOutput(const QString &action) {
+    if (action == "scroll" || (scrollMode_ && historyIndex_ < 0 && action == "finish")) {
+        requestScrollCapture();
+        return;
+    }
     if (done_ || outputPending_ || refreshing_)
         return;
     if (selection_.isEmpty())
@@ -822,6 +836,34 @@ void CaptureOverlay::requestOutput(const QString &action) {
     refreshTimer_.stop();
     emit outputRequested(selectionDocument(), selectedGlobal(), action,
                          QApplication::keyboardModifiers().testFlag(Qt::AltModifier));
+}
+void CaptureOverlay::requestScrollCapture() {
+    if (done_ || outputPending_ || refreshing_ || historyIndex_ >= 0)
+        return;
+    if (selection_.isEmpty())
+        selection_ = hover_;
+    if (selection_.width() < 80 || selection_.height() < 100) {
+        QToolTip::showText(QCursor::pos(), QStringLiteral("请选择至少 80 × 100 像素的滚动内容区域。"), this);
+        return;
+    }
+    syncSelection();
+    canvas_->finishDrawing();
+    outputPending_ = true;
+    resumeRefresh_ = refreshTimer_.isActive();
+    refreshTimer_.stop();
+    detectionTimer_.stop();
+    hide();
+    emit scrollRequested(selectedGlobal(), selectionDocument());
+}
+void CaptureOverlay::resumeScrollCapture() {
+    if (done_)
+        return;
+    completeOutput(false);
+    detectionTimer_.start();
+    show();
+    raise();
+    activateWindow();
+    setFocus();
 }
 void CaptureOverlay::completeOutput(bool successful, bool closeCapture) {
     outputPending_ = false;
@@ -979,9 +1021,11 @@ void CaptureOverlay::paintEvent(QPaintEvent *) {
     painter.setBrush(QColor(251, 251, 251, 245));
     painter.drawRoundedRect(help, uiPixels(7), uiPixels(7));
     painter.setPen(QColor("#343434"));
-    const QString helpText = selecting_
-        ? QStringLiteral("拖动空白处移动选区 · 边框缩放 · Ctrl+D 尺寸 · Enter 复制 · , . 历史 · Esc 取消")
-        : QStringLiteral("拖动边框调整范围 · Shift 约束 · 1/2 粗细 · 右键结束编辑 · Enter 复制 · Esc 取消");
+    const QString helpText = scrollMode_ && historyIndex_ < 0
+        ? QStringLiteral("框选同一窗口内的滚动内容 · Enter 开始长截屏 · Ctrl+D 尺寸 · Esc 取消")
+        : selecting_
+            ? QStringLiteral("拖动空白处移动选区 · 边框缩放 · Ctrl+L 长截屏 · Enter 复制 · , . 历史 · Esc 取消")
+            : QStringLiteral("拖动边框调整范围 · Shift 约束 · 1/2 粗细 · 右键结束编辑 · Enter 复制 · Esc 取消");
     painter.drawText(help.adjusted(12, 0, -10, 0), Qt::AlignVCenter,
                      helpText + (refreshTimer_.isActive() ? QStringLiteral("  [连续刷新]") : ""));
     if (historyIndex_ >= 0) {
@@ -1168,7 +1212,7 @@ void CaptureOverlay::mouseReleaseEvent(QMouseEvent *event) {
 }
 void CaptureOverlay::mouseDoubleClickEvent(QMouseEvent *event) {
     if (event->button() == Qt::LeftButton && selecting_ && selection_.contains(event->pos()))
-        requestOutput("copy");
+        requestOutput(scrollMode_ && historyIndex_ < 0 ? "scroll" : "copy");
 }
 bool CaptureOverlay::magnifierVisible() const {
     const bool automatic = selection_.isEmpty() || pressed_ || handleAt(mouse_) >= 0;
@@ -1253,7 +1297,7 @@ void CaptureOverlay::keyPressEvent(QKeyEvent *event) {
             typed_.clear();
             syncSelection();
         } else
-            requestOutput("copy");
+            requestOutput(scrollMode_ && historyIndex_ < 0 ? "scroll" : "copy");
         return;
     }
     if (key >= Qt::Key_0 && key <= Qt::Key_9 && modifiers == Qt::NoModifier && typed_.size() < 13) {
@@ -1513,7 +1557,7 @@ bool CaptureOverlay::eventFilter(QObject *object, QEvent *event) {
                 if (selecting_ && !typed_.isEmpty())
                     keyPressEvent(key);
                 else
-                    requestOutput("copy");
+                    requestOutput(scrollMode_ && historyIndex_ < 0 ? "scroll" : "copy");
                 return true;
             }
         }

@@ -7,10 +7,111 @@
 #include <BitMatrix.h>
 #include <windows.h>
 #include <shellapi.h>
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
 namespace {
+bool waitForNativeClipboard() {
+    if (QGuiApplication::platformName() != "windows")
+        return true;
+    // Allow delayed OLE rendering and clipboard observers to finish between
+    // scripted actions, as the regular user-interface event loop would.
+    QTest::qWait(10);
+    QElapsedTimer wait;
+    wait.start();
+    while (!OpenClipboard(nullptr)) {
+        if (wait.elapsed() >= 2000)
+            return false;
+        QTest::qWait(10);
+    }
+    CloseClipboard();
+    return true;
+}
+
+QImage scrollTestDocument(int width, int height) {
+    QImage image(width, height, QImage::Format_RGB32);
+    image.fill(QColor("#fafbfc"));
+    QPainter painter(&image);
+    QFont font("Segoe UI");
+    font.setPixelSize(16);
+    painter.setFont(font);
+    for (int y = 0, i = 0; y < height; y += 57, ++i) {
+        painter.fillRect(14, y + 6, width - 28, 45,
+                         QColor(225 + i * 7 % 25, 220 + i * 11 % 30, 215 + i * 13 % 35));
+        painter.setPen(QColor(20 + i * 7 % 120, 30 + i * 17 % 120, 40 + i * 23 % 120));
+        painter.drawText(25, y + 28, QString("Row %1   Value %2   Scroll capture content")
+                         .arg(i).arg(i * 7919 % 100003));
+        painter.fillRect(25, y + 35, 30 + i * 41 % (width - 65), 3, painter.pen().color());
+    }
+    return image;
+}
+
+QImage scrollTestFrame(const QImage &content, int offset, int height, int header = 0, int footer = 0) {
+    QImage frame(content.width(), height, QImage::Format_RGB32);
+    frame.fill(QColor("#16324f"));
+    QPainter painter(&frame);
+    painter.drawImage(QRect(0, header, frame.width(), height - header - footer), content,
+                      QRect(0, offset, frame.width(), height - header - footer));
+    painter.fillRect(0, height - footer, frame.width(), footer, QColor("#cad7e0"));
+    return frame;
+}
+
+QImage scrollFloatingTestFrame(const QImage &content, int offset, int height, int controls) {
+    QImage frame = content.copy(0, offset, content.width(), height);
+    QPainter painter(&frame);
+    painter.setRenderHint(QPainter::Antialiasing);
+    const int width = frame.width();
+    if (controls != 1) {
+        painter.setPen(QColor("#dcdfe3"));
+        painter.setBrush(QColor("#fdfdfd"));
+        painter.drawRoundedRect(QRect(20, height - 168, width - 40, 140), 18, 18);
+        painter.setPen(QColor("#aab0b7"));
+        painter.drawText(40, height - 131, "Message or create task ...");
+        painter.drawText(50, height - 60, "+     Full access");
+        painter.drawText(width - 235, height - 60, "Model selection");
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor("#a6bbee"));
+        painter.drawEllipse(QRect(width - 86, height - 84, 40, 40));
+    }
+    if (controls != 0) {
+        painter.setBrush(QColor("#f6f7f8"));
+        painter.setPen(QColor("#9ea4ab"));
+        painter.drawEllipse(QRect(width - 108, height - 230, 52, 52));
+        painter.drawText(QRect(width - 108, height - 230, 52, 52), Qt::AlignCenter, "v");
+        painter.drawRoundedRect(QRect(width - 142, height / 3, 112, 104), 12, 12);
+        painter.drawText(QRect(width - 132, height / 3, 92, 104), Qt::AlignCenter, "Pinned\nTools\nMenu");
+    }
+    return frame;
+}
+
+class ScrollTestPage : public QWidget {
+  public:
+    QImage content = scrollTestDocument(560, 1350);
+    int offset = 0;
+    int wheelEvents = 0;
+    bool floatingControls = false;
+    ScrollTestPage() : QWidget(nullptr, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint) {
+        resize(content.width(), 440);
+    }
+    QImage frame() const {
+        return floatingControls ? scrollFloatingTestFrame(content, offset, height(), 2)
+                                : scrollTestFrame(content, offset, height(), 38, 26);
+    }
+  protected:
+    void paintEvent(QPaintEvent *) override {
+        QPainter painter(this);
+        painter.drawImage(0, 0, frame());
+    }
+    void wheelEvent(QWheelEvent *event) override {
+        ++wheelEvents;
+        offset = qBound(0, offset - event->angleDelta().y() * 96 / 120,
+                        content.height() - (height() - 64));
+        update();
+        event->accept();
+    }
+};
+
 Document sampleDocument() {
     Document document;
     document.image = QImage(880, 520, QImage::Format_RGB32);
@@ -85,6 +186,1079 @@ int runSelfTests(const QString &directory, bool native) {
             ++failures;
         QTextStream(stdout) << (result ? "PASS " : "FAIL ") << name << '\n';
     };
+    {
+        using Status = ScrollStitcher::Status;
+        const QImage content = scrollTestDocument(480, 4200);
+        for (const auto &fixed : {QPair<int, int>(0, 0), {38, 26}, {75, 0}, {0, 70}}) {
+            ScrollStitcher stitcher;
+            int previous = 0;
+            for (int offset : {0, 113, 301, 380, 605, 606, 850, 1080}) {
+                const QImage frame = scrollTestFrame(content, offset, 560, fixed.first, fixed.second);
+                const auto result = stitcher.append(frame);
+                check(QString("scroll exact displacement %1 header %2 footer %3 status %4")
+                      .arg(offset).arg(fixed.first).arg(fixed.second).arg(int(result.status)),
+                      offset == 0 ? result.status == Status::FirstFrame :
+                          result.status == Status::Appended && result.displacement == offset - previous);
+                previous = offset;
+            }
+            const QImage expected = scrollTestFrame(content, 0, 1640, fixed.first, fixed.second);
+            check(QString("scroll original pixels preserved header %1 footer %2").arg(fixed.first).arg(fixed.second),
+                  stitcher.image() == expected);
+            check("scroll unchanged frame is not appended",
+                  stitcher.append(scrollTestFrame(content, 1080, 560, fixed.first, fixed.second)).status == Status::Unchanged &&
+                  stitcher.image() == expected);
+            check("scroll upward movement retracts the captured range",
+                  stitcher.append(scrollTestFrame(content, 950, 560, fixed.first, fixed.second)).status == Status::Retracted &&
+                  stitcher.image() == scrollTestFrame(content, 0, 1510, fixed.first, fixed.second));
+            check("scroll preview has bounded size", QRect(QPoint(), QSize(180, 240)).contains(stitcher.preview({180, 240}).rect()));
+            ScrollStitcher adjustable;
+            adjustable.append(scrollTestFrame(content, 800, 560, fixed.first, fixed.second));
+            int previousPosition = 0;
+            for (int position : {160, 420, 680, 530, 529, 280, 10, 0, -150, -300, -100, 80, 330, 650, 430, 210, 150, 0}) {
+                const auto result = adjustable.append(scrollTestFrame(content, 800 + position, 560, fixed.first, fixed.second));
+                check(QString("scroll range follows down and up position %1 header %2 footer %3")
+                    .arg(position).arg(fixed.first).arg(fixed.second),
+                    result.displacement == position - previousPosition &&
+                    adjustable.image() == scrollTestFrame(content, 800, 560 + qMax(0, position), fixed.first, fixed.second));
+                previousPosition = position;
+            }
+        }
+        ScrollStitcher gaps;
+        gaps.append(content.copy(0, 0, 480, 560));
+        check("scroll rejects missing overlap", gaps.append(content.copy(0, 1800, 480, 560)).status == Status::Uncertain);
+        check("scroll recovers after excessive or reverse movement",
+              gaps.append(content.copy(0, 130, 480, 560)).status == Status::Appended &&
+              gaps.image() == content.copy(0, 0, 480, 690));
+        for (const auto &fixed : {QPair<int, int>(0, 0), {38, 26}}) {
+            ScrollStitcher recovery;
+            auto frameAt = [&](int offset) { return scrollTestFrame(content, offset, 560, fixed.first, fixed.second); };
+            for (int offset = 0; offset <= 2200; offset += 200)
+                recovery.append(frameAt(offset));
+            const QImage beforeGap = recovery.image();
+            check("scroll recovery rejects an uncaptured gap " + QString::number(fixed.first),
+                  recovery.append(frameAt(3400)).status == Status::Uncertain && recovery.image() == beforeGap);
+            const auto recovered = recovery.append(frameAt(650));
+            check("scroll recovers an earlier captured viewport after losing overlap " + QString::number(fixed.first),
+                  recovered.status == Status::Retracted && recovered.displacement == -1550 &&
+                  recovery.image() == scrollTestFrame(content, 0, 1210, fixed.first, fixed.second));
+            check("scroll recovery resumes forward capture " + QString::number(fixed.first),
+                  recovery.append(frameAt(850)).status == Status::Appended &&
+                  recovery.image() == scrollTestFrame(content, 0, 1410, fixed.first, fixed.second));
+            check("scroll recovery returns directly to the first screen " + QString::number(fixed.first),
+                  recovery.append(frameAt(0)).status == Status::Retracted && recovery.image() == frameAt(0));
+            check("scroll recovery discards the trimmed future " + QString::number(fixed.first),
+                  recovery.append(frameAt(2200)).status == Status::Uncertain && recovery.image() == frameAt(0));
+        }
+        QImage duplicatedContent = content.copy();
+        {
+            QPainter painter(&duplicatedContent);
+            painter.drawImage(QPoint(0, 900), content.copy(0, 0, 480, 700));
+        }
+        ScrollStitcher ambiguousRecovery;
+        for (int offset = 0; offset <= 2560; offset += 160)
+            ambiguousRecovery.append(duplicatedContent.copy(0, offset, 480, 560));
+        const QImage retained = ambiguousRecovery.image();
+        check("scroll recovery rejects duplicated historical passages",
+              ambiguousRecovery.append(duplicatedContent.copy(0, 50, 480, 560)).status == Status::Uncertain &&
+              ambiguousRecovery.image() == retained);
+        QImage partiallyChanged = duplicatedContent.copy(0, 1700, 480, 560);
+        {
+            QPainter painter(&partiallyChanged);
+            painter.fillRect(0, 230, 480, 330, Qt::black);
+        }
+        check("scroll recovery verifies content beyond the matching anchors",
+              ambiguousRecovery.append(partiallyChanged).status == Status::Uncertain &&
+              ambiguousRecovery.image() == retained);
+        ScrollStitcher cachedCheck;
+        cachedCheck.append(content.copy(0, 0, 480, 560));
+        const QImage futureFrame = content.copy(0, 800, 480, 560);
+        check("scroll unchanged unmatched frames retain the verified range",
+              cachedCheck.append(futureFrame).status == Status::Uncertain &&
+              cachedCheck.append(futureFrame.copy()).status == Status::Uncertain &&
+              cachedCheck.append(futureFrame.convertToFormat(QImage::Format_RGBA8888)).status == Status::Uncertain &&
+              cachedCheck.image() == content.copy(0, 0, 480, 560));
+        const auto bridge = cachedCheck.append(content.copy(0, 400, 480, 560));
+        const auto recovered = cachedCheck.append(futureFrame);
+        check("scroll commits invalidate cached checks before revisiting the same frame",
+              bridge.status == Status::Appended && recovered.status == Status::Appended &&
+              recovered.displacement == 400 && cachedCheck.image() == content.copy(0, 0, 480, 1360));
+        ScrollStitcher cachedRetraction;
+        const QImage startingFrame = content.copy(0, 800, 480, 560);
+        const QImage earlierFrame = content.copy(0, 0, 480, 560);
+        cachedRetraction.append(startingFrame);
+        const auto initiallyMissing = cachedRetraction.append(earlierFrame);
+        const auto aboveStart = cachedRetraction.append(content.copy(0, 400, 480, 560));
+        const auto earlier = cachedRetraction.append(earlierFrame);
+        check("scroll retraction above the start invalidates cached checks",
+              initiallyMissing.status == Status::Uncertain && aboveStart.status == Status::Retracted &&
+              earlier.status == Status::Retracted && earlier.displacement == -400 &&
+              cachedRetraction.image() == startingFrame);
+        for (const auto &fixed : {QPair<int, int>(0, 0), {38, 26}, {90, 55}}) {
+            const int bodyHeight = 600 - fixed.first - fixed.second;
+            for (int percent : {50, 60, 66, 67, 70}) {
+                ScrollStitcher fast;
+                const int step = bodyHeight * percent / 100;
+                fast.append(scrollTestFrame(content, 17, 600, fixed.first, fixed.second));
+                bool matched = true;
+                for (int offset : {step, step * 2, step * 3}) {
+                    const auto result = fast.append(scrollTestFrame(content, 17 + offset, 600, fixed.first, fixed.second));
+                    matched = matched && result.status == Status::Appended && result.displacement == step;
+                }
+                check(QString("scroll large steps %1 percent header %2 footer %3")
+                      .arg(percent).arg(fixed.first).arg(fixed.second), matched &&
+                      fast.image() == scrollTestFrame(content, 17, 600 + step * 3, fixed.first, fixed.second));
+                bool retracted = true;
+                for (int offset : {step * 2, step, 0}) {
+                    const auto result = fast.append(scrollTestFrame(content, 17 + offset, 600, fixed.first, fixed.second));
+                    retracted = retracted && result.status == Status::Retracted && result.displacement == -step &&
+                        fast.image() == scrollTestFrame(content, 17, 600 + offset, fixed.first, fixed.second);
+                }
+                check(QString("scroll large upward steps %1 percent header %2 footer %3")
+                      .arg(percent).arg(fixed.first).arg(fixed.second), retracted);
+            }
+        }
+        QImage spaced = content.copy();
+        QPainter blankMargins(&spaced);
+        blankMargins.fillRect(0, 0, spaced.width(), 120, Qt::white);
+        blankMargins.fillRect(0, 800, spaced.width(), 200, Qt::white);
+        blankMargins.end();
+        for (int header : {0, 38}) {
+            ScrollStitcher margins;
+            const int height = 600 + header + 26;
+            margins.append(scrollTestFrame(spaced, 0, height, header, 26));
+            const auto result = margins.append(scrollTestFrame(spaced, 400, height, header, 26));
+            check("scroll one third overlap with different blank margins header " + QString::number(header),
+                  result.status == Status::Appended && result.displacement == 400 &&
+                  margins.image() == scrollTestFrame(spaced, 0, height + 400, header, 26));
+        }
+        ScrollStitcher torn;
+        const QImage original = content.copy(0, 0, 480, 600);
+        torn.append(original);
+        QImage inconsistent = content.copy(0, 350, 480, 600);
+        QPainter tearing(&inconsistent);
+        tearing.drawImage(QRect(0, 125, 480, 125), content, QRect(0, 555, 480, 125));
+        tearing.end();
+        check("scroll conflicting motion inside overlap is rejected",
+              torn.append(inconsistent).status == Status::Uncertain && torn.image() == original);
+        ScrollStitcher smallSteps;
+        smallSteps.append(content.copy(0, 0, 160, 160));
+        bool frequentFrames = true;
+        for (int offset = 1; offset <= 2300; ++offset)
+            frequentFrames = smallSteps.append(content.copy(0, offset, 160, 160)).status == Status::Appended && frequentFrames;
+        check("scroll high cadence small steps pass the previous frame count ceiling",
+              frequentFrames && smallSteps.image() == content.copy(0, 0, 160, 2460));
+        check("scroll tiny steps use bounded storage tiles", smallSteps.frameCount() < 32);
+        bool trimmedTiles = true;
+        for (int offset = 2200; offset >= 0; offset -= 100)
+            trimmedTiles = smallSteps.append(content.copy(0, offset, 160, 160)).status == Status::Retracted &&
+                smallSteps.image() == content.copy(0, 0, 160, offset + 160) && trimmedTiles;
+        check("scroll merged tiles retract to the original pixels", trimmedTiles);
+        check("scroll extends again after merged tile retraction",
+              smallSteps.append(content.copy(0, 100, 160, 160)).status == Status::Appended &&
+              smallSteps.image() == content.copy(0, 0, 160, 260));
+        const QImage before = gaps.image();
+        check("scroll invalid dimensions preserve committed pixels",
+              gaps.append(QImage(481, 560, QImage::Format_RGB32)).status == Status::Invalid && gaps.image() == before);
+        check("scroll rejects null frame", gaps.append({}).status == Status::Invalid);
+        QImage blank(480, 560, QImage::Format_RGB32);
+        blank.fill(Qt::white);
+        ScrollStitcher blankStitcher;
+        blankStitcher.append(blank);
+        check("scroll blank viewport does not grow", blankStitcher.append(blank).status == Status::Unchanged);
+        QImage stripes(480, 1500, QImage::Format_RGB32);
+        for (int y = 0; y < stripes.height(); ++y)
+            std::fill_n(reinterpret_cast<QRgb *>(stripes.scanLine(y)), stripes.width(),
+                         y % 40 < 20 ? qRgb(40, 60, 90) : qRgb(230, 240, 250));
+        ScrollStitcher repeated;
+        repeated.append(stripes.copy(0, 0, 480, 560));
+        check("scroll refuses ambiguous repetitive content",
+              repeated.append(stripes.copy(0, 127, 480, 560)).status == Status::Uncertain);
+        for (bool pixelLimit : {false, true}) {
+            ScrollStitcher limited(pixelLimit ? 30000 : 650, pixelLimit ? 480 * 650 : 32 * 1024 * 1024);
+            limited.append(content.copy(0, 0, 480, 560));
+            check("scroll dimension and memory limits retain original",
+                  limited.append(content.copy(0, 140, 480, 560)).status == Status::LimitReached &&
+                  limited.image() == content.copy(0, 0, 480, 560));
+            limited.append(content.copy(0, 80, 480, 560));
+            limited.append(content.copy(0, 180, 480, 560));
+            check("scroll range can retract after reaching image limits",
+                  limited.append(content.copy(0, 30, 480, 560)).status == Status::Retracted &&
+                  limited.image() == content.copy(0, 0, 480, 590));
+        }
+        ScrollStitcher changed;
+        changed.append(content.copy(0, 0, 480, 560));
+        QImage badge = content.copy(0, 130, 480, 560);
+        QPainter badgePainter(&badge);
+        badgePainter.fillRect(350, 200, 40, 20, Qt::red);
+        badgePainter.end();
+        check("scroll tolerates a small changed content patch", changed.append(badge).status == Status::Appended);
+        ScrollStitcher antialiasing;
+        antialiasing.append(content.copy(0, 0, 480, 560));
+        QImage adjusted = content.copy(0, 130, 480, 560);
+        for (int y = 0; y < adjusted.height(); ++y) {
+            auto *pixels = reinterpret_cast<QRgb *>(adjusted.scanLine(y));
+            for (int x = 0; x < adjusted.width(); ++x)
+                pixels[x] = qRgb(qMin(255, qRed(pixels[x]) + 1), qMin(255, qGreen(pixels[x]) + 1),
+                                 qMin(255, qBlue(pixels[x]) + 1));
+        }
+        const auto adjustedResult = antialiasing.append(adjusted);
+        check("scroll falls back to tolerant matching when exact row hashes change",
+              adjustedResult.status == Status::Appended && adjustedResult.displacement == 130 &&
+              antialiasing.size().height() == 690);
+        ScrollStitcher formats;
+        formats.append(content.copy(0, 0, 480, 560).convertToFormat(QImage::Format_RGB888));
+        check("scroll normalizes input formats without resizing",
+              formats.append(content.copy(0, 111, 480, 560).convertToFormat(QImage::Format_RGBA8888)).status == Status::Appended &&
+              formats.image() == content.copy(0, 0, 480, 671));
+        QImage article(720, 2800, QImage::Format_RGB32);
+        article.fill(Qt::white);
+        QPainter textPainter(&article);
+        QFont articleFont("Microsoft YaHei UI");
+        articleFont.setPixelSize(17);
+        textPainter.setFont(articleFont);
+        textPainter.setPen(QColor("#202020"));
+        const QStringList phrases{QStringLiteral("滚动页面中的文字和图片"), QStringLiteral("原始分辨率与清晰细节"),
+            QStringLiteral("采集稳定后的内容"), QStringLiteral("保留每一行的完整信息"),
+            QStringLiteral("支持随时暂停和继续"), QStringLiteral("重叠区域的位移校验"),
+            QStringLiteral("文档阅读与截图标注"), QStringLiteral("记录并整理重要内容")};
+        quint32 random = 918273;
+        for (int y = 28; y < article.height(); y += 29) {
+            QString line;
+            for (int word = 0; word < 3; ++word) {
+                random = random * 1664525u + 1013904223u;
+                line += phrases[int((random >> 16) % phrases.size())] + " ";
+            }
+            textPainter.drawText(25, y, line);
+        }
+        textPainter.end();
+        ScrollStitcher textOnly;
+        textOnly.append(article.copy(0, 0, 720, 700));
+        for (int offset : {143, 333, 525, 712, 1000})
+            check("scroll black text on white article " + QString::number(offset),
+                  textOnly.append(article.copy(0, offset, 720, 700)).status == Status::Appended &&
+                  textOnly.image() == article.copy(0, 0, 720, 700 + offset));
+        check("scroll stability rejects a moving viewport", !ScrollStitcher::sameFrame(
+                  article.copy(0, 120, 720, 700), article.copy(0, 150, 720, 700)));
+        const QRect fileView(210, 100, 590, 510);
+        QImage fileList(fileView.width(), 2400, QImage::Format_RGB32);
+        fileList.fill(Qt::white);
+        QPainter filePainter(&fileList);
+        QFont fileFont("Segoe UI");
+        fileFont.setPixelSize(16);
+        filePainter.setFont(fileFont);
+        for (int y = 0, row = 0; y < fileList.height(); y += 32, ++row) {
+            filePainter.fillRect(14, y + 8, 12, 16, QColor("#e2e2e2"));
+            filePainter.setPen(QColor("#202020"));
+            filePainter.drawText(42, y + 23, QString("%1_Document_%2.txt").arg(row, 3, 10, QChar('0')).arg(row * 7919));
+            filePainter.drawText(330, y + 23, "2026-11-08");
+            filePainter.drawText(465, y + 23, "Text document");
+        }
+        filePainter.end();
+        auto explorerFrame = [&](int offset) {
+            QImage frame(900, 640, QImage::Format_RGB32);
+            frame.fill(Qt::white);
+            QPainter painter(&frame);
+            painter.fillRect(0, 0, 900, 100, QColor(offset ? "#e8e8e8" : "#f3f3f3"));
+            painter.fillRect(800, 100, 100, 510, QColor("#f4f4f4"));
+            painter.fillRect(0, 610, 900, 30, QColor("#eaeaea"));
+            painter.setFont(fileFont);
+            painter.setPen(Qt::black);
+            painter.drawText(20, 40, QStringLiteral("文件资源管理器 · 固定工具栏"));
+            for (int row = 0; row < 9; ++row)
+                painter.drawText(20, 145 + row * 46, "Folder " + QString::number(row));
+            painter.drawText(812, 160, "Details");
+            painter.drawText(20, 632, "75 items");
+            painter.drawImage(fileView.topLeft(), scrollTestFrame(fileList, offset, fileView.height(), 38, 0));
+            return frame;
+        };
+        for (bool identifyViewport : {false, true}) {
+            ScrollStitcher explorer;
+            if (identifyViewport)
+                explorer.setViewport(fileView);
+            const QImage first = explorerFrame(0);
+            explorer.append(first);
+            int previous = 0;
+            for (int offset : {1, 16, 48, 80, 112, 176, 240}) {
+                const auto result = explorer.append(explorerFrame(offset));
+                check(QString("scroll whole window with fixed panes offset %1 viewport %2")
+                      .arg(offset).arg(identifyViewport),
+                      result.status == Status::Appended && result.displacement == offset - previous);
+                const QImage expected = scrollTestFrame(fileList, 0, fileView.height() + offset, 38, 0);
+                check("scroll Explorer style list pixels are preserved", explorer.image().copy(
+                          fileView.x(), fileView.y(), fileView.width(), expected.height()) == expected);
+                previous = offset;
+            }
+            if (identifyViewport) {
+                const QImage output = explorer.image();
+                check("scroll fixed navigation and details panes appear once",
+                      output.copy(0, 0, 210, 610) == first.copy(0, 0, 210, 610) &&
+                      output.copy(800, 0, 100, 610) == first.copy(800, 0, 100, 610) &&
+                      output.pixelColor(40, 720) == QColor(Qt::white) &&
+                      output.pixelColor(840, 720) == QColor("#f4f4f4"));
+                const QSize previewSize = output.size() / 2;
+                const QImage preview = explorer.preview(previewSize);
+                check("scroll fixed pane preview preserves background extensions",
+                      preview.pixelColor(20, 360) == QColor(Qt::white) &&
+                      preview.pixelColor(420, 360) == QColor("#f4f4f4"));
+                output.save(QDir(directory).filePath("scroll-fixed-panes.png"));
+                const auto retracted = explorer.append(explorerFrame(100));
+                check("scroll fixed panes survive range retraction", retracted.status == Status::Retracted &&
+                      explorer.image().copy(fileView.x(), fileView.y(), fileView.width(), fileView.height() + 100) ==
+                          scrollTestFrame(fileList, 0, fileView.height() + 100, 38, 0) &&
+                      explorer.image().copy(0, 0, 210, 610) == first.copy(0, 0, 210, 610));
+            }
+        }
+        QImage chromeChange = explorerFrame(0);
+        QPainter chromePainter(&chromeChange);
+        chromePainter.fillRect(20, 20, 150, 40, Qt::red);
+        chromePainter.end();
+        check("scroll stable frame ignores changes outside the identified viewport",
+              ScrollStitcher::sameFrame(explorerFrame(0), chromeChange, fileView));
+        QImage floatingContent(960, 15000, QImage::Format_RGB32);
+        floatingContent.fill(Qt::white);
+        QPainter floatingPainter(&floatingContent);
+        QFont floatingFont("Segoe UI");
+        floatingFont.setPixelSize(18);
+        floatingPainter.setFont(floatingFont);
+        for (int y = 30, row = 0; y < floatingContent.height(); y += 37, ++row) {
+            floatingPainter.setPen(QColor(20 + row % 50, 25, 40));
+            floatingPainter.drawText(28, y, QString("%1  Floating capture %2    Original page content")
+                                     .arg(row).arg(row * 7919));
+            floatingPainter.fillRect(32, y + 4, 35 + row * 43 % 880, 2, QColor(50, 80 + row % 100, 130));
+        }
+        floatingPainter.end();
+        for (int controls : {0, 1, 2}) {
+            for (int step : {1, 37, 113, 247, 420}) {
+                ScrollStitcher floating;
+                floating.append(scrollFloatingTestFrame(floatingContent, 0, 720, controls));
+                bool matched = true;
+                for (int offset = step; offset <= 26 * step; offset += step) {
+                    const auto result = floating.append(scrollFloatingTestFrame(floatingContent, offset, 720, controls));
+                    matched = matched && result.status == Status::Appended && result.displacement == step &&
+                        floating.size().height() == 720 + offset;
+                }
+                const QString label = QString(" controls %1 step %2").arg(controls).arg(step);
+                const QImage expected = scrollFloatingTestFrame(floatingContent, 0, 720 + 26 * step, controls);
+                const int checkedWidth = controls == 0 ? 960 : 800;
+                check("scroll floating controls allow continuous matching" + label, matched);
+                check("scroll floating composer occurs once and body pixels are exact" + label,
+                      floating.image().copy(0, 0, checkedWidth, expected.height()) ==
+                      expected.copy(0, 0, checkedWidth, expected.height()));
+                bool retracted = true;
+                for (int offset : {25 * step, 24 * step, 23 * step}) {
+                    const auto result = floating.append(scrollFloatingTestFrame(floatingContent, offset, 720, controls));
+                    const QImage expectedTrim = scrollFloatingTestFrame(floatingContent, 0, 720 + offset, controls);
+                    retracted = retracted && result.status == Status::Retracted && result.displacement == -step &&
+                        floating.image().copy(0, 0, checkedWidth, expectedTrim.height()) ==
+                        expectedTrim.copy(0, 0, checkedWidth, expectedTrim.height());
+                }
+                check("scroll floating controls support upward retraction" + label, retracted);
+            }
+            ScrollStitcher missing;
+            const QImage first = scrollFloatingTestFrame(floatingContent, 0, 720, controls);
+            missing.append(first);
+            check("scroll fixed controls cannot bridge missing content " + QString::number(controls),
+                  missing.append(scrollFloatingTestFrame(floatingContent, 9000, 720, controls)).status == Status::Uncertain &&
+                  missing.image() == first);
+            for (bool viewport : {false, true}) {
+                ScrollStitcher recovery;
+                const QRect body(80, 48, 960, 720);
+                auto framed = [&](int offset) {
+                    QImage frame(1120, 800, QImage::Format_RGB32);
+                    frame.fill(QColor("#edf0f4"));
+                    QPainter painter(&frame);
+                    painter.setPen(QColor("#737d87"));
+                    painter.drawRect(frame.rect().adjusted(16, 16, -17, -17));
+                    painter.drawText(100, 30, "Fixed toolbar and sidebars");
+                    for (int y = 65; y < 780; y += 35) {
+                        painter.drawText(20, y, "List");
+                        painter.drawText(1050, y, "Code");
+                    }
+                    painter.drawImage(body.topLeft(), scrollFloatingTestFrame(floatingContent, offset, 720, controls));
+                    return frame;
+                };
+                if (viewport)
+                    recovery.setViewport(body);
+                for (int offset = 0; offset <= 2880; offset += 160)
+                    recovery.append(framed(offset));
+                const QImage beforeGap = recovery.image();
+                check("scroll framed recovery rejects a forward gap " + QString::number(controls) + QString::number(viewport),
+                      recovery.append(framed(9000)).status == Status::Uncertain && recovery.image() == beforeGap);
+                const auto result = recovery.append(framed(480));
+                const QImage expected = scrollFloatingTestFrame(floatingContent, 0, 1200, controls);
+                const int checkedWidth = controls == 0 ? 960 : 800;
+                check("scroll historical recovery with fixed panes and floating controls " + QString::number(controls) + QString::number(viewport),
+                      result.status == Status::Retracted && result.displacement == -2400 &&
+                      recovery.image().copy(body.left(), body.top(), checkedWidth, 1200) ==
+                          expected.copy(0, 0, checkedWidth, 1200));
+                check("scroll historical recovery clears stale failure cache " + QString::number(controls) + QString::number(viewport),
+                      recovery.append(framed(640)).status == Status::Appended &&
+                      recovery.append(framed(9000)).status == Status::Uncertain);
+            }
+        }
+        for (bool sparse : {false, true}) {
+            QImage longList(960, 27000, QImage::Format_RGB32);
+            longList.fill(Qt::white);
+            QPainter painter(&longList);
+            painter.setFont(fileFont);
+            painter.setPen(QColor("#202020"));
+            for (int row = 0, y = 24; y < longList.height(); ++row, y += sparse ? 150 : 32) {
+                painter.drawText(20, y, QString("Document_2026_11_%1.txt").arg(row, 6, 10, QChar('0')));
+                if (!sparse) {
+                    painter.drawText(480, y, "2026-11-10  12:00");
+                    painter.drawText(810, y, "Text document");
+                }
+            }
+            painter.end();
+            if (!sparse) {
+                ScrollStitcher repetitiveFloating;
+                bool matched = true;
+                for (int offset = 0; offset <= 7000; offset += 700) {
+                    const auto result = repetitiveFloating.append(scrollFloatingTestFrame(longList, offset, 1290, 0));
+                    matched = matched && (offset == 0 ||
+                        (result.status == Status::Appended && result.displacement == 700));
+                }
+                check("scroll repeated glyphs do not shorten the fast-scroll overlap around a composer",
+                      matched && repetitiveFloating.image() == scrollFloatingTestFrame(longList, 0, 8290, 0));
+            }
+            for (int step : {32, 127, 530}) {
+                if (sparse && step == 530)
+                    continue;
+                ScrollStitcher longCapture;
+                longCapture.append(longList.copy(0, 0, 960, 640));
+                bool matched = true;
+                int lastOffset = 0;
+                QElapsedTimer elapsed;
+                elapsed.start();
+                for (int offset = step; offset < 26000; offset += step) {
+                    const auto result = longCapture.append(longList.copy(0, offset, 960, 640));
+                    matched = matched && result.status == Status::Appended && result.displacement == step &&
+                        longCapture.size().height() == offset + 640;
+                    lastOffset = offset;
+                }
+                check(QString("scroll 26000 pixel similar filenames sparse %1 step %2").arg(sparse).arg(step),
+                      matched && longCapture.image() == longList.copy(0, 0, 960, lastOffset + 640));
+                QTextStream(stdout) << "Scroll long list sparse " << sparse << " step " << step << " frames "
+                    << lastOffset / step << " took " << elapsed.elapsed() << " ms\n";
+                const int upwardStep = qMin(step, 127);
+                bool retracted = true;
+                for (int offset = lastOffset - upwardStep; offset >= lastOffset - 5 * upwardStep; offset -= upwardStep) {
+                    const auto result = longCapture.append(longList.copy(0, offset, 960, 640));
+                    retracted = retracted && result.status == Status::Retracted && result.displacement == -upwardStep &&
+                        longCapture.image() == longList.copy(0, 0, 960, offset + 640);
+                }
+                check("scroll long list preserves pixels when retracting " + QString::number(step), retracted);
+                const auto recovered = longCapture.append(longList.copy(0, 320, 960, 640));
+                check(QString("scroll long list recovers across its retained history sparse %1 step %2").arg(sparse).arg(step),
+                      recovered.status == Status::Retracted &&
+                      longCapture.image() == longList.copy(0, 0, 960, 960));
+            }
+            ScrollStitcher gap;
+            gap.append(longList.copy(0, 0, 960, 640));
+            const auto result = gap.append(longList.copy(0, 9000, 960, 640));
+            check("scroll similar filenames across a gap do not create a false seam " + QString::number(sparse),
+                  result.status == Status::Uncertain && gap.image() == longList.copy(0, 0, 960, 640));
+            check("scroll sparse number changes are detected as motion " + QString::number(sparse),
+                  !ScrollStitcher::sameFrame(longList.copy(0, 0, 960, 640), longList.copy(0, 9000, 960, 640)));
+            for (const auto &movement : {QPair<int, int>(16350, -417), {14046, 543}, {7068, -455}, {13268, 2000}}) {
+                ScrollStitcher repeatedLabels;
+                const QImage first = longList.copy(0, movement.first, 960, 640);
+                repeatedLabels.append(first);
+                const auto result = repeatedLabels.append(longList.copy(0, movement.first + movement.second, 960, 640));
+                check(QString("scroll repetitive text is not mistaken for a fixed control sparse %1 offset %2")
+                    .arg(sparse).arg(movement.first),
+                    result.displacement == movement.second ||
+                    (result.status == Status::Uncertain && repeatedLabels.image() == first));
+            }
+        }
+        QImage wide = scrollTestDocument(1920, 2800);
+        ScrollStitcher highDpi;
+        highDpi.append(wide.copy(0, 0, 1920, 1440));
+        QElapsedTimer elapsed;
+        elapsed.start();
+        const auto result = highDpi.append(wide.copy(0, 477, 1920, 1440));
+        QTextStream(stdout) << "Scroll 1920x1440 match took " << elapsed.elapsed() << " ms\n";
+        check("scroll high resolution pixels and alignment", result.status == Status::Appended &&
+              highDpi.image() == wide.copy(0, 0, 1920, 1917));
+        highDpi.preview({180, 240}).save(QDir(directory).filePath("scroll-preview.png"));
+        for (int percent : {100, 150, 200}) {
+            settings.set("appearance/uiScale", percent / 100.0);
+            applyAppearance(settings);
+            ScrollCaptureWindow panel(QRect(50, 60, 480, 560));
+            panel.setAttribute(Qt::WA_DeleteOnClose, false);
+            panel.setAttribute(Qt::WA_DontShowOnScreen);
+            panel.timer_.stop();
+            panel.stitcher_->append(content.copy(0, 0, 480, 560));
+            panel.stitcher_->append(content.copy(0, 130, 480, 560));
+            panel.updateProgress(panel.stitcher_->preview({uiPixels(260), uiPixels(200)}));
+            panel.pause(QStringLiteral("已暂停。恢复后将从最后成功拼接的位置继续。"));
+            QCoreApplication::processEvents();
+            check("scroll controls fit at " + QString::number(percent),
+                  panel.rect().contains(panel.finishButton_->geometry()) &&
+                  panel.rect().contains(panel.copyButton_->geometry()) &&
+                  !panel.findChild<QPushButton *>("scrollAutomatic"));
+            panel.grab().save(QDir(directory).filePath(QString("scroll-panel-%1.png").arg(percent)));
+            Document finished;
+            QObject::connect(&panel, &ScrollCaptureWindow::completed, &panel,
+                             [&](const Document &document) { finished = document; });
+            panel.finish();
+            check("scroll complete returns full resolution document", finished.image == content.copy(0, 0, 480, 690));
+        }
+        settings.set("appearance/uiScale", 1.0);
+        applyAppearance(settings);
+        {
+            ScrollCaptureWindow copying(QRect(50, 60, 480, 560));
+            copying.setAttribute(Qt::WA_DeleteOnClose, false);
+            copying.setAttribute(Qt::WA_DontShowOnScreen);
+            copying.timer_.stop();
+            copying.stitcher_->append(content.copy(0, 0, 480, 560));
+            copying.stitcher_->append(content.copy(0, 320, 480, 560));
+            copying.stitcher_->append(content.copy(0, 140, 480, 560));
+            copying.updateProgress(copying.stitcher_->preview({260, 200}));
+            copying.pause(QStringLiteral("复制回缩后的范围"));
+            int attempts = 0;
+            Document copied;
+            QSignalSpy completed(&copying, &ScrollCaptureWindow::completed);
+            QSignalSpy canceled(&copying, &ScrollCaptureWindow::canceled);
+            QObject::connect(&copying, &ScrollCaptureWindow::copyRequested, &copying,
+                             [&](const Document &document) {
+                copied = document;
+                copying.completeCopy(++attempts == 2);
+            });
+            copying.copyButton_->click();
+            QElapsedTimer wait;
+            wait.start();
+            while (copying.finishPending_ && wait.elapsed() < 2500)
+                QTest::qWait(10);
+            check("scroll failed copy preserves the retracted range for retry", attempts == 1 &&
+                  !copying.closed_ && copying.paused_ && copying.copyButton_->isEnabled() &&
+                  copying.stitcher_->image() == content.copy(0, 0, 480, 700));
+            MSG copyMessage{};
+            copyMessage.message = WM_HOTKEY;
+            copyMessage.wParam = 0x5e71;
+            copying.copyHotkeyRegistered_ = true;
+            const bool handled = copying.nativeEventFilter("windows_dispatcher_MSG", &copyMessage, nullptr);
+            copying.copyHotkeyRegistered_ = false;
+            check("scroll hotkey accepts dispatcher events with a null result pointer", handled);
+            QCoreApplication::processEvents();
+            wait.restart();
+            while (copying.finishPending_ && wait.elapsed() < 2500)
+                QTest::qWait(10);
+            check("scroll copy retry returns current range and closes exactly once", attempts == 2 &&
+                  copying.closed_ && copied.image == content.copy(0, 0, 480, 700) &&
+                  completed.isEmpty() && canceled.isEmpty());
+        }
+        Native::Desktop desktop;
+        desktop.image = content.copy(0, 0, 480, 560);
+        desktop.geometry = QRect(-600, 100, 480, 560);
+        desktop.screens = {desktop.geometry};
+        CaptureOverlay overlay(desktop, settings, QRect(-560, 130, 380, 400), true);
+        overlay.setAttribute(Qt::WA_DeleteOnClose, false);
+        overlay.setAttribute(Qt::WA_DontShowOnScreen);
+        bool requested = false;
+        QObject::connect(&overlay, &CaptureOverlay::scrollRequested, &overlay,
+                         [&](const QRect &region, const Document &draft) {
+            requested = region == QRect(-560, 130, 380, 400) && draft.image.size() == QSize(380, 400);
+        });
+        overlay.show();
+        overlay.requestOutput("finish");
+        check("scroll selection entry uses physical negative coordinates", requested && overlay.outputPending_ && !overlay.isVisible());
+        overlay.resumeScrollCapture();
+        check("cancel scroll restores original capture selection", overlay.isVisible() && !overlay.outputPending_ &&
+              overlay.selectedGlobal() == QRect(-560, 130, 380, 400));
+        bool historyCopied = false;
+        Document replay;
+        replay.image = content.copy(0, 0, 480, 900);
+        overlay.setHistory(1, [replay](int) { return replay; });
+        overlay.replayHistory(1);
+        QObject::connect(&overlay, &CaptureOverlay::outputRequested, &overlay,
+                         [&](const Document &, const QRect &, const QString &action, bool) { historyCopied = action == "copy"; });
+        QTest::keyClick(overlay.canvas_, Qt::Key_Return);
+        check("scroll mode keeps history Enter output working", historyCopied &&
+              !overlay.findChild<QAction *>("captureScroll")->isEnabled());
+        overlay.hide();
+    }
+    {
+        Settings scrollSettings(temporary.path() + "/scroll-application");
+        scrollSettings.set("hotkeys/enabled", false);
+        scrollSettings.set("capture/superDrag", false);
+        scrollSettings.set("general/tray", false);
+        scrollSettings.set("general/notifications", false);
+        Application controller(scrollSettings);
+        controller.window_->hide();
+        const QImage content = scrollTestDocument(480, 1800);
+        Native::Desktop desktop;
+        desktop.image = content.copy(0, 0, 480, 560);
+        desktop.geometry = desktop.image.rect();
+        desktop.screens = {desktop.geometry};
+        controller.showCapture(desktop, desktop.geometry, true);
+        QPointer<CaptureOverlay> overlay = controller.capture_;
+        overlay->setAttribute(Qt::WA_DontShowOnScreen);
+        Document draft = overlay->canvas_->document();
+        Annotation annotation;
+        annotation.tool = Tool::Rectangle;
+        annotation.rect = QRectF(15, 20, 100, 80);
+        draft.annotations.append(annotation);
+        overlay->canvas_->setDocument(draft);
+        overlay->findChild<QAction *>("captureScroll")->trigger();
+        controller.scrollCapture_->timer_.stop();
+        check("scroll toolbar action opens capture controller", !overlay->isVisible() && controller.scrollCapture_->isVisible());
+        controller.scrollCapture_->close();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        check("scroll cancel returns to application capture draft", controller.scrollCapture_.isNull() && overlay->isVisible() &&
+              overlay->canvas_->document().annotations.size() == 1);
+        QTest::keyClick(overlay->canvas_, Qt::Key_Return);
+        auto *panel = controller.scrollCapture_.data();
+        check("scroll mode Enter opens controller through annotation canvas", panel != nullptr);
+        if (panel) {
+            panel->timer_.stop();
+            panel->stitcher_->append(content.copy(0, 0, 480, 560));
+            panel->stitcher_->append(content.copy(0, 170, 480, 560));
+            panel->pause(QStringLiteral("测试完成输出"));
+            panel->finish();
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+            auto *editor = controller.editors_.last().data();
+            const Document result = editor->canvas()->document();
+            check("scroll completed document opens editor with original annotations", overlay.isNull() &&
+                  result.image == content.copy(0, 0, 480, 730) && result.annotations.size() == 1 && result.sourceRect.isEmpty());
+            editor->outputRequested(result, "copy", false);
+            const auto records = controller.library_.records();
+            check("scroll result copies and saves editable history through normal output", records.size() == 1 &&
+                  controller.library_.document(records.first().id).image == result.image &&
+                  controller.library_.document(records.first().id).annotations.size() == 1 &&
+                  QApplication::clipboard()->image() == result.render());
+            editor->close();
+        }
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        controller.showCapture(desktop, desktop.geometry, true);
+        overlay = controller.capture_;
+        overlay->setAttribute(Qt::WA_DontShowOnScreen);
+        overlay->canvas_->setDocument(draft);
+        overlay->findChild<QAction *>("captureScroll")->trigger();
+        QPointer<ScrollCaptureWindow> copying = controller.scrollCapture_;
+        copying->timer_.stop();
+        copying->stitcher_->append(content.copy(0, 0, 480, 560));
+        copying->stitcher_->append(content.copy(0, 300, 480, 560));
+        copying->stitcher_->append(content.copy(0, 120, 480, 560));
+        copying->pause(QStringLiteral("直接复制回缩后的范围"));
+        const int editorsBeforeCopy = controller.editors_.size();
+        Document expectedCopy = draft;
+        expectedCopy.image = content.copy(0, 0, 480, 680);
+        copying->copy();
+        QElapsedTimer copyWait;
+        copyWait.start();
+        while (copying && !copying->closed_ && copyWait.elapsed() < 3000)
+            QTest::qWait(10);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        waitForNativeClipboard();
+        const auto copiedRecords = controller.library_.records();
+        check("scroll direct copy closes capture and keeps editor count", copying.isNull() && overlay.isNull() &&
+              controller.editors_.size() == editorsBeforeCopy &&
+              scrollSettings.value("capture/lastRect").toRect() == desktop.geometry);
+        check("scroll direct copy includes trimmed pixels and original annotations", copiedRecords.size() == 2 &&
+              controller.library_.document(copiedRecords.first().id).image == expectedCopy.image &&
+              controller.library_.document(copiedRecords.first().id).annotations.size() == 1 &&
+              QApplication::clipboard()->image() == expectedCopy.render());
+    }
+    if (native) {
+        ScrollTestPage page;
+        page.move(QGuiApplication::primaryScreen()->availableGeometry().topLeft() + QPoint(50, 70));
+        page.show();
+        page.raise();
+        QTest::qWait(250);
+        const QRect region(page.mapToGlobal(QPoint()), page.size());
+        const auto target = Native::scrollTarget(region);
+        check("scroll native region capture preserves pixels", Native::captureRegion(region) == page.frame());
+        check("scroll native target validates selected window", Native::scrollTargetValid(target, region));
+        {
+            QWidget occluder(nullptr, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+            occluder.setGeometry(QRect(region.center() - QPoint(40, 40), QSize(80, 80)));
+            occluder.show();
+            occluder.raise();
+            QTest::qWait(100);
+            check("scroll detects overlapping windows", !Native::scrollTargetValid(target, region));
+        }
+        page.move(page.pos() + QPoint(3, 0));
+        check("scroll detects moved windows", !Native::scrollTargetValid(target, region));
+        page.move(region.topLeft());
+        QTest::qWait(100);
+        {
+            const QRect crop = region.adjusted(20, 20, -20, -20);
+            ScrollCaptureWindow masked(crop);
+            masked.setAttribute(Qt::WA_DeleteOnClose, false);
+            masked.timer_.stop();
+            masked.show();
+            QTest::qWait(120);
+            const QImage screen = Native::captureRegion(region);
+            const QImage source = page.frame();
+            check("scroll mask dims pixels outside the selected rectangle", masked.mask_->isVisible() &&
+                  screen.pixelColor(10, 100).red() < source.pixelColor(10, 100).red() - 30);
+            check("scroll mask aperture preserves selected pixels", Native::captureRegion(crop) == source.copy(20, 20, 520, 400));
+            check("scroll mask leaves the selection out of its native region",
+                  !masked.mask_->mask().contains(crop.center() - masked.mask_->geometry().topLeft()) &&
+                  masked.mask_->windowFlags().testFlag(Qt::WindowTransparentForInput));
+            masked.close();
+            check("scroll closing clears mask and session hotkey", !masked.mask_->isVisible() && !masked.copyHotkeyRegistered_);
+        }
+        QTimer foreground;
+        QObject::connect(&foreground, &QTimer::timeout, &page, [&] {
+            page.raise();
+            for (auto *widget : QApplication::topLevelWidgets())
+                if (widget->objectName() == "scrollCaptureMask" && widget->isVisible())
+                    widget->raise();
+            for (auto *widget : QApplication::topLevelWidgets())
+                if (qobject_cast<ScrollCaptureWindow *>(widget) && widget->isVisible())
+                    widget->raise();
+        });
+        foreground.start(80);
+        ScrollCaptureWindow panel(region);
+        panel.setAttribute(Qt::WA_DeleteOnClose, false);
+        panel.show();
+        panel.move(region.topLeft() + QPoint(220, 30));
+        QTest::qWait(120);
+        if (panel.captureExcluded_) {
+            check("scroll panel exclusion preserves underlying pixels", Native::captureRegion(region) == page.frame());
+            check("scroll target remains valid beneath excluded panel",
+                  Native::scrollTargetValid(target, region, quintptr(panel.winId())));
+        }
+        QElapsedTimer wait;
+        wait.start();
+        while ((panel.busy_ || panel.stitcher_->frameCount() == 0) && !panel.paused_ && wait.elapsed() < 5000)
+            QTest::qWait(20);
+        QTest::qWait(300);
+        check("scroll session waits for manual input", page.offset == 0 && page.wheelEvents == 0 &&
+              !panel.findChild<QPushButton *>("scrollAutomatic"));
+        QTimer wheelInput;
+        QObject::connect(&wheelInput, &QTimer::timeout, &page, [&] {
+            DWORD_PTR result = 0;
+            SendMessageTimeoutW(reinterpret_cast<HWND>(page.winId()), WM_MOUSEWHEEL,
+                MAKEWPARAM(0, static_cast<WORD>(-WHEEL_DELTA)),
+                MAKELPARAM(region.center().x(), region.center().y()), SMTO_ABORTIFHUNG, 150, &result);
+            if (page.offset == page.content.height() - 376)
+                wheelInput.stop();
+        });
+        wheelInput.start(150);
+        wait.restart();
+        while ((wheelInput.isActive() || panel.busy_ || panel.stitcher_->size().height() < 1414) &&
+               !panel.paused_ && wait.elapsed() < 10000)
+            QTest::qWait(10);
+        wheelInput.stop();
+        panel.timer_.stop();
+        check("scroll manual wheel pipeline reaches the selected endpoint", page.offset == page.content.height() - 376 &&
+              !panel.busy_ && panel.stitcher_->size().height() == 1414);
+        QTextStream(stdout) << "Scroll native status " << panel.status_->text() << " offset " << page.offset
+                            << " wheel events " << page.wheelEvents << '\n';
+        Document result;
+        QObject::connect(&panel, &ScrollCaptureWindow::completed, &panel,
+                         [&](const Document &document) { result = document; });
+        panel.grab().save(QDir(directory).filePath("scroll-native-panel.png"));
+        panel.pause(QStringLiteral("完成当前范围"));
+        panel.finish();
+        const QImage expected = scrollTestFrame(page.content, 0, page.content.height() + 64, 38, 26);
+        check("scroll native end to end output is pixel identical", result.image == expected);
+        result.image.save(QDir(directory).filePath("scroll-native-result.png"));
+        ScrollCaptureWindow finishing(region);
+        finishing.setAttribute(Qt::WA_DeleteOnClose, false);
+        finishing.timer_.stop();
+        finishing.stitcher_->append(page.frame());
+        finishing.candidate_ = page.frame();
+        finishing.sample();
+        Document inFlightResult;
+        QObject::connect(&finishing, &ScrollCaptureWindow::completed, &finishing,
+                         [&](const Document &document) { inFlightResult = document; });
+        finishing.finish();
+        wait.restart();
+        while (!finishing.closed_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll finish drains in flight frame exactly once", finishing.closed_ && inFlightResult.image == page.frame());
+        page.offset = 0;
+        page.update();
+        QTest::qWait(100);
+        ScrollCaptureWindow settling(region);
+        settling.setAttribute(Qt::WA_DeleteOnClose, false);
+        settling.timer_.stop();
+        settling.stitcher_->append(page.frame());
+        page.offset = 96;
+        page.update();
+        QTest::qWait(100);
+        Document finalViewport;
+        QObject::connect(&settling, &ScrollCaptureWindow::completed, &settling,
+                         [&](const Document &document) { finalViewport = document; });
+        settling.finish();
+        wait.restart();
+        while (!settling.closed_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll finish captures final viewport while waiting for settling", settling.closed_ &&
+              finalViewport.image == scrollTestFrame(page.content, 0, 536, 38, 26));
+        QPointer<ScrollCaptureWindow> canceling = new ScrollCaptureWindow(region);
+        canceling->timer_.stop();
+        QSignalSpy canceled(canceling, &ScrollCaptureWindow::canceled);
+        QSignalSpy completed(canceling, &ScrollCaptureWindow::completed);
+        canceling->sample();
+        canceling->close();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QTest::qWait(150);
+        check("scroll cancel during pending capture releases window without output", canceling.isNull() && canceled.count() == 1 && completed.isEmpty());
+        page.offset = 0;
+        page.update();
+        page.raise();
+        QTest::qWait(100);
+        ScrollCaptureWindow rapid(region);
+        rapid.setAttribute(Qt::WA_DeleteOnClose, false);
+        rapid.show();
+        wait.restart();
+        while ((rapid.busy_ || rapid.stitcher_->frameCount() == 0) && !rapid.paused_ && wait.elapsed() < 5000)
+            QTest::qWait(10);
+        int motionSteps = 0, framesDuringMotion = 0;
+        QTimer motion;
+        motion.setTimerType(Qt::PreciseTimer);
+        motion.setInterval(100);
+        QObject::connect(&motion, &QTimer::timeout, &page, [&] {
+            if (!rapid.busy_)
+                framesDuringMotion = qMax(framesDuringMotion, rapid.stitcher_->frameCount());
+            page.offset = qMin(page.content.height() - 376, page.offset + 125);
+            page.update();
+            page.raise();
+            rapid.raise();
+            if (++motionSteps == 8)
+                motion.stop();
+        });
+        motion.start();
+        wait.restart();
+        while (motion.isActive() && wait.elapsed() < 3000)
+            QTest::qWait(5);
+        motion.stop();
+        wait.restart();
+        while ((rapid.busy_ || rapid.stitcher_->size().height() < 1414) &&
+               !rapid.paused_ && wait.elapsed() < 2000)
+            QTest::qWait(10);
+        check("scroll continuously moving frames are accepted before settling", framesDuringMotion >= 3);
+        Document rapidResult;
+        QObject::connect(&rapid, &ScrollCaptureWindow::completed, &rapid,
+                         [&](const Document &document) { rapidResult = document; });
+        rapid.finish();
+        wait.restart();
+        while (!rapid.closed_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll rapid capture has no missing or duplicated pixels", rapidResult.image == expected);
+        rapidResult.image.save(QDir(directory).filePath("scroll-rapid-result.png"));
+        page.offset = 0;
+        page.update();
+        QTest::qWait(100);
+        ScrollCaptureWindow copying(region);
+        copying.setAttribute(Qt::WA_DeleteOnClose, false);
+        copying.show();
+        wait.restart();
+        while ((copying.busy_ || copying.stitcher_->frameCount() == 0) && !copying.paused_ && wait.elapsed() < 5000)
+            QTest::qWait(10);
+        auto manualWheel = [&](int delta) {
+            DWORD_PTR result = 0;
+            SendMessageTimeoutW(reinterpret_cast<HWND>(page.winId()), WM_MOUSEWHEEL,
+                MAKEWPARAM(0, static_cast<WORD>(delta)),
+                MAKELPARAM(region.center().x(), region.center().y()), SMTO_ABORTIFHUNG, 150, &result);
+        };
+        for (int step = 0; step < 5; ++step) {
+            manualWheel(-WHEEL_DELTA);
+            QTest::qWait(160);
+        }
+        wait.restart();
+        while ((copying.busy_ || copying.stitcher_->size().height() != 920) &&
+               !copying.paused_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll manual down input extends the current range", !copying.busy_ &&
+              copying.stitcher_->size().height() == 920);
+        manualWheel(WHEEL_DELTA);
+        QTest::qWait(160);
+        manualWheel(WHEEL_DELTA);
+        wait.restart();
+        while ((copying.busy_ || copying.stitcher_->size().height() != 728) &&
+               !copying.paused_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll manual up input retracts the current range without duplicate rows", !copying.busy_ &&
+              copying.stitcher_->image() == scrollTestFrame(page.content, 0, 728, 38, 26));
+        copying.timer_.stop();
+        manualWheel(WHEEL_DELTA);
+        page.repaint();
+        QTest::qWait(60);
+        Document copied;
+        int copyRequests = 0;
+        QSignalSpy edited(&copying, &ScrollCaptureWindow::completed);
+        QSignalSpy copyCanceled(&copying, &ScrollCaptureWindow::canceled);
+        QObject::connect(&copying, &ScrollCaptureWindow::copyRequested, &copying,
+                         [&](const Document &document) {
+            ++copyRequests;
+            copied = document;
+            QApplication::clipboard()->setImage(document.image);
+            copying.completeCopy(QApplication::clipboard()->ownsClipboard());
+        });
+        // A separate Win32 input window exercises RegisterHotKey without Qt's
+        // application shortcut fallback. Keep input at this process's integrity
+        // level, as in the global-hotkey dispatch regression below.
+        foreground.stop();
+        HWND inputTarget = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", L"EasySnip scroll copy test",
+                                           WS_POPUP | WS_VISIBLE, -32000, -32000, 1, 1,
+                                           nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SetForegroundWindow(inputTarget);
+        QTest::qWait(30);
+        check("scroll Ctrl+C is registered for the active capture", copying.copyHotkeyRegistered_);
+        // Windows may keep the user's foreground application active. Both
+        // that application and this native fixture bypass Qt widget shortcuts.
+        const HWND keyboardTarget = GetForegroundWindow();
+        check("scroll global copy input bypasses Qt widget shortcuts", keyboardTarget &&
+              !QWidget::find(quintptr(keyboardTarget)));
+        INPUT copyKeys[4]{};
+        for (auto &key : copyKeys)
+            key.type = INPUT_KEYBOARD;
+        copyKeys[0].ki.wVk = VK_CONTROL;
+        copyKeys[1].ki.wVk = 'C';
+        copyKeys[2].ki.wVk = 'C';
+        copyKeys[2].ki.dwFlags = KEYEVENTF_KEYUP;
+        copyKeys[3].ki.wVk = VK_CONTROL;
+        copyKeys[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        check("scroll native Ctrl+C input is delivered", SendInput(4, copyKeys, sizeof(INPUT)) == 4);
+        wait.restart();
+        while (!copying.closed_ && wait.elapsed() < 4000)
+            QTest::qWait(10);
+        DestroyWindow(inputTarget);
+        waitForNativeClipboard();
+        const QImage expectedCopy = scrollTestFrame(page.content, 0, 632, 38, 26);
+        check("scroll Ctrl+C drains final upward movement and copies current pixels", copying.closed_ &&
+              copyRequests == 1 && copied.image == expectedCopy && QApplication::clipboard()->image() == expectedCopy);
+        check("scroll copy releases its mask and hotkey without edit or cancel", !copying.mask_->isVisible() &&
+              !copying.copyHotkeyRegistered_ && edited.isEmpty() && copyCanceled.isEmpty());
+        const bool hotkeyReleased = RegisterHotKey(nullptr, 0x5e72, MOD_CONTROL | MOD_NOREPEAT, 'C');
+        check("scroll Ctrl+C is available to other owners after completion", hotkeyReleased);
+        if (hotkeyReleased)
+            UnregisterHotKey(nullptr, 0x5e72);
+        copied.image.save(QDir(directory).filePath("scroll-retracted-copy.png"));
+        copying.close();
+        page.content = scrollTestDocument(560, 12000);
+        page.offset = 0;
+        page.update();
+        foreground.start();
+        QTest::qWait(100);
+        ScrollCaptureWindow longCapture(region);
+        longCapture.setAttribute(Qt::WA_DeleteOnClose, false);
+        longCapture.show();
+        wait.restart();
+        while ((longCapture.busy_ || longCapture.stitcher_->frameCount() == 0) &&
+               !longCapture.paused_ && wait.elapsed() < 5000)
+            QTest::qWait(10);
+        for (int step = 0; step < 100; ++step) {
+            manualWheel(-WHEEL_DELTA);
+            QTest::qWait(100);
+        }
+        wait.restart();
+        while ((longCapture.busy_ || longCapture.stitcher_->size().height() != 10040) &&
+               !longCapture.paused_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll native continuous wheel capture exceeds ten thousand pixels",
+              !longCapture.busy_ && longCapture.stitcher_->image() == scrollTestFrame(page.content, 0, 10040, 38, 26));
+        for (int step = 0; step < 4; ++step) {
+            manualWheel(WHEEL_DELTA);
+            QTest::qWait(100);
+        }
+        Document longResult;
+        QObject::connect(&longCapture, &ScrollCaptureWindow::completed, &longCapture,
+                         [&](const Document &document) { longResult = document; });
+        longCapture.finish();
+        wait.restart();
+        while (!longCapture.closed_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll native long range finishes after upward trimming with exact pixels",
+              longCapture.closed_ && longResult.image == scrollTestFrame(page.content, 0, 9656, 38, 26));
+        longResult.image.save(QDir(directory).filePath("scroll-long-native.png"));
+        longCapture.close();
+        page.offset = 0;
+        page.update();
+        QTest::qWait(100);
+        ScrollCaptureWindow recoveryCapture(region);
+        recoveryCapture.setAttribute(Qt::WA_DeleteOnClose, false);
+        recoveryCapture.show();
+        wait.restart();
+        while ((recoveryCapture.busy_ || recoveryCapture.stitcher_->frameCount() == 0) &&
+               !recoveryCapture.paused_ && wait.elapsed() < 5000)
+            QTest::qWait(10);
+        for (int step = 0; step < 20; ++step) {
+            manualWheel(-WHEEL_DELTA);
+            QTest::qWait(100);
+        }
+        wait.restart();
+        while ((recoveryCapture.busy_ || recoveryCapture.stitcher_->size().height() != 2360) &&
+               !recoveryCapture.paused_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        page.offset = 9000;
+        page.update();
+        wait.restart();
+        while ((recoveryCapture.busy_ || !recoveryCapture.uncertainTime_.isValid()) &&
+               !recoveryCapture.paused_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll native missing overlap preserves the captured range",
+              recoveryCapture.uncertainTime_.isValid() &&
+              recoveryCapture.stitcher_->image() == scrollTestFrame(page.content, 0, 2360, 38, 26));
+        page.offset = 480;
+        page.update();
+        wait.restart();
+        while ((recoveryCapture.busy_ || recoveryCapture.stitcher_->size().height() != 920) &&
+               !recoveryCapture.paused_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll native cross-screen return recovers and retracts automatically",
+              !recoveryCapture.uncertainTime_.isValid() &&
+              recoveryCapture.stitcher_->image() == scrollTestFrame(page.content, 0, 920, 38, 26));
+        Document recoveryResult;
+        QObject::connect(&recoveryCapture, &ScrollCaptureWindow::completed, &recoveryCapture,
+                         [&](const Document &document) { recoveryResult = document; });
+        recoveryCapture.finish();
+        wait.restart();
+        while (!recoveryCapture.closed_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll native recovered range completes with original pixels",
+              recoveryCapture.closed_ && recoveryResult.image == scrollTestFrame(page.content, 0, 920, 38, 26));
+        recoveryCapture.close();
+        page.content = scrollTestDocument(960, 10000);
+        page.resize(960, 720);
+        page.offset = 0;
+        page.floatingControls = true;
+        page.update();
+        QTest::qWait(120);
+        const QRect floatingRegion(page.mapToGlobal(QPoint()), page.size());
+        ScrollCaptureWindow floatingCapture(floatingRegion);
+        floatingCapture.setAttribute(Qt::WA_DeleteOnClose, false);
+        floatingCapture.show();
+        wait.restart();
+        while ((floatingCapture.busy_ || floatingCapture.stitcher_->frameCount() == 0) &&
+               !floatingCapture.paused_ && wait.elapsed() < 5000)
+            QTest::qWait(10);
+        for (int step = 0; step < 40; ++step) {
+            manualWheel(-WHEEL_DELTA);
+            QTest::qWait(120);
+        }
+        wait.restart();
+        while ((floatingCapture.busy_ || floatingCapture.stitcher_->size().height() != 4560) &&
+               !floatingCapture.paused_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll native floating input and buttons preserve the captured body",
+              !floatingCapture.busy_ && floatingCapture.stitcher_->image().copy(0, 0, 800, 4560) ==
+              scrollFloatingTestFrame(page.content, 0, 4560, 2).copy(0, 0, 800, 4560));
+        for (int step = 0; step < 5; ++step) {
+            manualWheel(WHEEL_DELTA);
+            QTest::qWait(120);
+        }
+        Document floatingResult;
+        QObject::connect(&floatingCapture, &ScrollCaptureWindow::completed, &floatingCapture,
+                         [&](const Document &document) { floatingResult = document; });
+        floatingCapture.finish();
+        wait.restart();
+        while (!floatingCapture.closed_ && wait.elapsed() < 2500)
+            QTest::qWait(10);
+        check("scroll native floating capture retracts and finishes with exact pixels",
+              floatingCapture.closed_ && floatingResult.image.size() == QSize(960, 4080) &&
+              floatingResult.image.copy(0, 0, 800, 4080) ==
+              scrollFloatingTestFrame(page.content, 0, 4080, 2).copy(0, 0, 800, 4080));
+        floatingResult.image.save(QDir(directory).filePath("scroll-floating-native.png"));
+        floatingCapture.close();
+        page.hide();
+    }
     {
         for (auto format : {QImage::Format_ARGB32, QImage::Format_ARGB32_Premultiplied,
                             QImage::Format_RGBA8888, QImage::Format_RGBA8888_Premultiplied,
@@ -669,7 +1843,9 @@ int runSelfTests(const QString &directory, bool native) {
         drag(&editCanvas, {170, 150}, {190, 170}, Qt::ControlModifier);
         check("control drag clones selected annotation", editCanvas.document().annotations.size() == 2 &&
               editCanvas.document().annotations.first().rect.topLeft() == QPointF(120, 110));
+        check("native clipboard available for annotation copy", waitForNativeClipboard());
         QTest::keyClick(&editCanvas, Qt::Key_C, Qt::ControlModifier | Qt::ShiftModifier);
+        check("native clipboard available for annotation paste", waitForNativeClipboard());
         QTest::keyClick(&editCanvas, Qt::Key_V, Qt::ControlModifier | Qt::ShiftModifier);
         check("annotation copy paste shortcuts", editCanvas.document().annotations.size() == 3);
         editCanvas.undo();
@@ -2278,7 +3454,10 @@ int runSelfTests(const QString &directory, bool native) {
             check("retired commands cannot create image windows or records", afterRemovedCommands.records().size() == 1);
             if (native) {
                 controller.command("capture");
-                QTest::qWait(350);
+                QElapsedTimer captureWait;
+                captureWait.start();
+                while ((!controller.capture_ || !controller.capture_->isVisible()) && captureWait.elapsed() < 5000)
+                    QTest::qWait(10);
                 QPointer<CaptureOverlay> capture;
                 bool standaloneEditor = false;
                 for (auto *widget : QApplication::topLevelWidgets()) {
@@ -2321,12 +3500,24 @@ int runSelfTests(const QString &directory, bool native) {
                           saveDialogCanceled && capture && capture->isVisible() &&
                               inlineCanvas->document().render() == expected.render() &&
                               afterCancel.records().size() == 1);
+                    check("native clipboard becomes available before output", waitForNativeClipboard());
                     capture->findChild<QAction *>("captureOutput-finish")->trigger();
                     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
                     Library capturedLibrary(applicationSettings);
                     check("inline completion closes application capture", capture.isNull());
-                    check("inline completion copies composited image",
-                          QApplication::clipboard()->image() == expected.render());
+                    check("native clipboard becomes available after output", waitForNativeClipboard());
+                    const QImage clipboardImage = QApplication::clipboard()->image();
+                    const QImage expectedImage = expected.render();
+                    if (clipboardImage != expectedImage) {
+                        clipboardImage.save(QDir(directory).filePath("clipboard-actual.png"));
+                        expectedImage.save(QDir(directory).filePath("clipboard-expected.png"));
+                        const auto *mime = QApplication::clipboard()->mimeData();
+                        QTextStream(stdout) << "Clipboard mismatch actual=" << clipboardImage.width() << 'x' << clipboardImage.height()
+                            << " format=" << int(clipboardImage.format()) << " expected=" << expectedImage.width() << 'x'
+                            << expectedImage.height() << " format=" << int(expectedImage.format())
+                            << " formats=" << (mime ? mime->formats().join(',') : QString()) << '\n';
+                    }
+                    check("inline completion copies composited image", clipboardImage == expectedImage);
                     check("inline completion stores editable history",
                           capturedLibrary.records().size() == 2 &&
                               capturedLibrary.document(capturedLibrary.records().first().id).annotations.size() == 1);
@@ -2337,7 +3528,9 @@ int runSelfTests(const QString &directory, bool native) {
                     for (bool includeCanceled : {false, true}) {
                         applicationSettings.set("history/includeCanceled", includeCanceled);
                         controller.command("last");
-                        QTest::qWait(350);
+                        captureWait.restart();
+                        while ((!controller.capture_ || !controller.capture_->isVisible()) && captureWait.elapsed() < 5000)
+                            QTest::qWait(10);
                         for (auto *widget : QApplication::topLevelWidgets())
                             if (auto *candidate = qobject_cast<CaptureOverlay *>(widget))
                                 if (candidate->isVisible())

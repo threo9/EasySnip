@@ -7,6 +7,7 @@
 #include <QSettings>
 #include <QTimer>
 #include <QDebug>
+#include <QOperatingSystemVersion>
 #include <windows.h>
 #include <shellapi.h>
 #include <dwmapi.h>
@@ -113,21 +114,10 @@ void Native::enableDpiAwareness() {
         setContext(reinterpret_cast<HANDLE>(-4));
 }
 
-Native::Desktop Native::captureDesktop(bool snapshotElements) {
-    Desktop desktop;
-    EnumDisplayMonitors(
-        nullptr, nullptr,
-        [](HMONITOR, HDC, LPRECT rect, LPARAM data) -> BOOL {
-            auto *result = reinterpret_cast<Desktop *>(data);
-            const QRect screen(rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top);
-            result->screens.append(screen);
-            result->geometry = result->geometry.united(screen);
-            return TRUE;
-        },
-        reinterpret_cast<LPARAM>(&desktop));
-    const QRect bounds = desktop.geometry;
+QImage Native::captureRegion(const QRect &bounds) {
+    QImage image;
     if (bounds.isEmpty())
-        return desktop;
+        return image;
     HDC screen = GetDC(nullptr);
     HDC memory = CreateCompatibleDC(screen);
     BITMAPINFO info{};
@@ -143,7 +133,7 @@ Native::Desktop Native::captureDesktop(bool snapshotElements) {
         HGDIOBJ old = SelectObject(memory, bitmap);
         if (BitBlt(memory, 0, 0, bounds.width(), bounds.height(), screen, bounds.x(), bounds.y(),
                    SRCCOPY | CAPTUREBLT)) {
-            desktop.image =
+            image =
                 QImage(static_cast<uchar *>(bits), bounds.width(), bounds.height(), QImage::Format_RGB32)
                     .copy();
         }
@@ -155,6 +145,91 @@ Native::Desktop Native::captureDesktop(bool snapshotElements) {
         DeleteDC(memory);
     if (screen)
         ReleaseDC(nullptr, screen);
+    return image;
+}
+
+Native::ScrollTarget Native::scrollTarget(const QRect &region) {
+    ScrollTarget target;
+    target.point = region.center();
+    const POINT point{target.point.x(), target.point.y()};
+    const HWND window = WindowFromPoint(point);
+    const HWND root = GetAncestor(window, GA_ROOT);
+    if (!window || !root || !windowRect(root).contains(region))
+        return {};
+    target.window = reinterpret_cast<quintptr>(window);
+    target.root = reinterpret_cast<quintptr>(root);
+    DWORD processId = 0;
+    GetWindowThreadProcessId(root, &processId);
+    target.processId = processId;
+    target.geometry = windowRect(root);
+    return target;
+}
+
+bool Native::scrollTargetValid(const ScrollTarget &target, const QRect &region, quintptr ignoredWindow) {
+    const HWND root = reinterpret_cast<HWND>(target.root);
+    const HWND window = reinterpret_cast<HWND>(target.window);
+    DWORD processId = 0;
+    GetWindowThreadProcessId(root, &processId);
+    if (!IsWindow(window) || !IsWindowVisible(root) || IsIconic(root) ||
+        processId != target.processId ||
+        GetAncestor(window, GA_ROOT) != root || windowRect(root) != target.geometry ||
+        !target.geometry.contains(region))
+        return false;
+    const QRect inside = region.adjusted(2, 2, -2, -2);
+    for (const auto &point : {inside.topLeft(), inside.topRight(), inside.center(),
+                              inside.bottomLeft(), inside.bottomRight()}) {
+        const POINT nativePoint{point.x(), point.y()};
+        HWND visible = GetAncestor(WindowFromPoint(nativePoint), GA_ROOT);
+        if (ignoredWindow && visible == reinterpret_cast<HWND>(ignoredWindow)) {
+            visible = GetWindow(visible, GW_HWNDNEXT);
+            while (visible) {
+                DWORD cloaked = 0;
+                DwmGetWindowAttribute(visible, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+                if (IsWindowVisible(visible) && !IsIconic(visible) && !cloaked && windowRect(visible).contains(point)) {
+                    // Respect native holes such as the scroll-capture mask.
+                    // Window regions use the full window origin, including
+                    // its non-client frame, rather than the client origin.
+                    RECT bounds{};
+                    GetWindowRect(visible, &bounds);
+                    HRGN shape = CreateRectRgn(0, 0, 0, 0);
+                    const bool coversPoint = GetWindowRgn(visible, shape) == ERROR ||
+                        PtInRegion(shape, point.x() - bounds.left, point.y() - bounds.top);
+                    DeleteObject(shape);
+                    if (coversPoint)
+                        break;
+                }
+                visible = GetWindow(visible, GW_HWNDNEXT);
+            }
+        }
+        if (visible != root)
+            return false;
+    }
+    return true;
+}
+
+bool Native::excludeFromCapture(quintptr window) {
+    const auto version = QOperatingSystemVersion::current();
+    // Older systems interpret 0x11 as WDA_MONITOR, which produces a black box.
+    if (version.majorVersion() < 10 || (version.majorVersion() == 10 && version.microVersion() < 19041))
+        return false;
+    return SetWindowDisplayAffinity(reinterpret_cast<HWND>(window), 0x00000011) != 0;
+}
+
+Native::Desktop Native::captureDesktop(bool snapshotElements) {
+    Desktop desktop;
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR, HDC, LPRECT rect, LPARAM data) -> BOOL {
+            auto *result = reinterpret_cast<Desktop *>(data);
+            const QRect screen(rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top);
+            result->screens.append(screen);
+            result->geometry = result->geometry.united(screen);
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&desktop));
+    if (desktop.geometry.isEmpty())
+        return desktop;
+    desktop.image = captureRegion(desktop.geometry);
 
     CURSORINFO cursor{sizeof(CURSORINFO), 0, nullptr, {0, 0}};
     if (GetCursorInfo(&cursor) && (cursor.flags & CURSOR_SHOWING)) {

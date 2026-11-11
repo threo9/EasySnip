@@ -223,6 +223,11 @@ QIcon Ui::commandIcon(const QString &command) {
             painter.drawPolyline(QPolygonF({{15, 21}, {21, 21}, {21, 15}}));
             painter.setPen(QPen(color, 1, Qt::DashLine));
             painter.drawRect(QRectF(7, 7, 10, 10));
+        } else if (command == "scroll") {
+            painter.drawRoundedRect(QRectF(4, 2, 16, 20), 2, 2);
+            painter.drawLine(8, 6, 16, 6);
+            painter.drawLine(12, 10, 12, 18);
+            painter.drawPolyline(QPolygonF({{8, 14}, {12, 18}, {16, 14}}));
         } else if (command == "open" || command == "folder") {
             painter.drawPolyline(QPolygonF({{3, 18}, {3, 5}, {10, 5}, {12, 8}, {20, 8}, {20, 10}}));
             painter.drawPolygon(QPolygonF({{3, 20}, {6, 11}, {22, 11}, {19, 20}}));
